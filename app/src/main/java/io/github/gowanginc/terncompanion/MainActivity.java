@@ -12,6 +12,7 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.graphics.drawable.StateListDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -22,7 +23,6 @@ import android.text.TextUtils;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
-import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
@@ -32,6 +32,10 @@ import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -72,6 +76,8 @@ public final class MainActivity extends Activity {
     private LinearLayout root;
     private TextView status;
     private Runnable refreshTick;
+    private HorizontalScrollView terminalKeys;
+    private boolean imeVisible;
     private boolean showBackground = false;
     private Host lastHost;
     private JSONArray lastSessions;
@@ -93,19 +99,16 @@ public final class MainActivity extends Activity {
         root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(PAPER);
-        root.setOnApplyWindowInsetsListener((view, insets) -> {
-            if (Build.VERSION.SDK_INT >= 30) {
-                android.graphics.Insets safe = insets.getInsets(
-                        WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout() | WindowInsets.Type.ime());
-                view.setPadding(safe.left, safe.top, safe.right, safe.bottom);
-            } else {
-                view.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(),
-                        insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());
-            }
+        ViewCompat.setOnApplyWindowInsetsListener(root, (view, insets) -> {
+            Insets safe = insets.getInsets(WindowInsetsCompat.Type.systemBars()
+                    | WindowInsetsCompat.Type.displayCutout() | WindowInsetsCompat.Type.ime());
+            view.setPadding(safe.left, safe.top, safe.right, safe.bottom);
+            imeVisible = insets.isVisible(WindowInsetsCompat.Type.ime());
+            if (terminalKeys != null) terminalKeys.setVisibility(imeVisible ? View.GONE : View.VISIBLE);
             return insets;
         });
         setContentView(root);
-        root.requestApplyInsets();
+        ViewCompat.requestApplyInsets(root);
         loadHosts();
     }
 
@@ -368,26 +371,30 @@ public final class MainActivity extends Activity {
         LinearLayout page = column();
         root.addView(page, new LinearLayout.LayoutParams(-1, -1));
 
-        // 1. Compact header (52dp): back, block label, live marker.
+        // Calm app bar; the reading surface carries no nested card borders.
         LinearLayout header = row();
         header.setGravity(Gravity.CENTER_VERTICAL);
-        header.setPadding(dp(6), 0, dp(12), 0);
-        header.setBackground(LineworkUi.cardBackground(this, CARD, EDGE));
+        header.setPadding(dp(8), 0, dp(16), 0);
+        header.setBackgroundColor(PAPER);
         Button backBtn = smallButton("‹");
-        backBtn.setTextSize(24);
+        backBtn.setTextSize(28);
+        backBtn.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2217634e),
+                null, bg(Color.WHITE, Color.TRANSPARENT)));
         backBtn.setContentDescription("Back");
         backBtn.setOnClickListener(v -> connect(h));
         header.addView(backBtn, new LinearLayout.LayoutParams(dp(48), dp(48)));
-        TextView headLabel = text(label, 17, INK, Typeface.SERIF, Typeface.BOLD);
+        TextView headLabel = text(label, 16, INK, Typeface.DEFAULT, Typeface.BOLD);
         headLabel.setSingleLine(true);
         headLabel.setEllipsize(TextUtils.TruncateAt.END);
         LinearLayout.LayoutParams headLp = weight1();
         headLp.leftMargin = dp(8);
         header.addView(headLabel, headLp);
-        TextView live = text("LIVE", 10, GREEN, Typeface.MONOSPACE, Typeface.BOLD);
-        live.setLetterSpacing(0.10f);
+        TextView live = text("Live", 12, GREEN, Typeface.DEFAULT, Typeface.NORMAL);
         header.addView(live);
-        page.addView(header, new LinearLayout.LayoutParams(-1, dp(52)));
+        page.addView(header, new LinearLayout.LayoutParams(-1, dp(56)));
+        View headerRule = rule();
+        headerRule.setBackgroundColor(0xffb4c8b7);
+        page.addView(headerRule, new LinearLayout.LayoutParams(-1, dp1()));
 
         // 2. Terminal pane: takes all remaining height, IME on or off.
         final TerminalView pane = new TerminalView(this);
@@ -406,43 +413,62 @@ public final class MainActivity extends Activity {
                 {"Ctrl+P", "ctrl+p"}, {"Ctrl+C", "ctrl+c"}, {"Esc", "Escape"}, {"Tab", "Tab"},
                 {"Enter", "Enter"}, {"↑", "Up"}, {"↓", "Down"}, {"←", "Left"}, {"→", "Right"}};
         HorizontalScrollView stripScroll = new HorizontalScrollView(this);
+        terminalKeys = stripScroll;
+        stripScroll.setVisibility(imeVisible ? View.GONE : View.VISIBLE);
         stripScroll.setHorizontalScrollBarEnabled(false);
         LinearLayout strip = row();
-        strip.setPadding(dp(6), 0, dp(6), 0);
+        strip.setPadding(dp(12), dp(4), dp(12), dp(4));
         for (int i = 0; i < keys.length; i++) {
             Button k = smallButton(keys[i][0]);
+            k.setTextSize(14);
+            k.setMinWidth(dp(48));
+            k.setMinimumWidth(dp(48));
+            k.setPadding(dp(12), dp(8), dp(12), dp(8));
+            k.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2217634e),
+                    null, bg(Color.WHITE, Color.TRANSPARENT)));
             String combo = keys[i][1];
             k.setContentDescription("Send " + combo);
             k.setOnClickListener(v -> send(h, sessionName, blockId, "keys", combo, null));
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(48));
-            if (i > 0) lp.leftMargin = dp(6);
+            if (i > 0) lp.leftMargin = dp(4);
             strip.addView(k, lp);
         }
         stripScroll.addView(strip);
-        page.addView(stripScroll, new LinearLayout.LayoutParams(-1, dp(48)));
+        page.addView(stripScroll, new LinearLayout.LayoutParams(-1, dp(56)));
+        ViewCompat.requestApplyInsets(root);
 
         // 4. Pinned composer: native multiline EditText plus an explicit Send.
         LinearLayout composer = row();
         composer.setGravity(Gravity.BOTTOM);
-        composer.setPadding(dp(8), dp(6), dp(8), dp(8));
-        composer.setBackground(LineworkUi.cardBackground(this, CARD, EDGE));
+        composer.setPadding(dp(16), dp(8), dp(16), dp(12));
+        composer.setBackgroundColor(CARD);
         final EditText input = new EditText(this);
-        input.setHint("Type a command…");
+        input.setHint("Message or command…");
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         input.setImeOptions(EditorInfo.IME_ACTION_NONE); // Enter inserts a newline; Send submits.
         input.setSingleLine(false);
         input.setMinLines(1);
         input.setMaxLines(4);
-        input.setMinHeight(dp(48));
+        input.setMinHeight(dp(56));
         input.setGravity(Gravity.TOP | Gravity.START);
-        input.setTextSize(15);
+        input.setTextSize(16);
         input.setTextColor(INK);
-        input.setHintTextColor(MUTED);
-        input.setPadding(dp(12), dp(10), dp(12), dp(10));
-        input.setBackgroundTintList(ColorStateList.valueOf(GREEN));
+        input.setHintTextColor(0xff5d6b64);
+        input.setPadding(dp(12), dp(12), dp(12), dp(12));
+        StateListDrawable fieldBackground = new StateListDrawable();
+        fieldBackground.addState(new int[]{android.R.attr.state_focused}, bg(CARD, GREEN));
+        fieldBackground.addState(new int[]{}, bg(0xffeeeee5, MUTED));
+        input.setBackground(fieldBackground);
         input.setContentDescription("Text to send to the terminal");
         composer.addView(input, weight1());
-        final Button sendButton = smallButton("Send ▸");
+        final Button sendButton = button("Send");
+        sendButton.setTextSize(14);
+        sendButton.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        sendButton.setMinWidth(dp(64));
+        sendButton.setMinimumWidth(dp(64));
+        sendButton.setTextColor(PAPER);
+        sendButton.setBackground(new RippleDrawable(ColorStateList.valueOf(0x44ffffff),
+                bg(GREEN, GREEN), null));
         sendButton.setContentDescription("Send the text and press Enter in the terminal");
         LinearLayout.LayoutParams sendLp = new LinearLayout.LayoutParams(-2, dp(48));
         sendLp.leftMargin = dp(8);
@@ -672,6 +698,7 @@ public final class MainActivity extends Activity {
 
     private void stopTick() {
         viewGen++; // invalidate any in-flight capture for the previous view
+        terminalKeys = null;
         if (refreshTick != null) { ui.removeCallbacks(refreshTick); refreshTick = null; }
         InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
         if (imm != null) imm.hideSoftInputFromWindow(getWindow().getDecorView().getWindowToken(), 0);

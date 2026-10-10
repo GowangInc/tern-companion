@@ -152,6 +152,12 @@ The Android checks run against the built APK with synthetic data. They do not re
 
 A release APK must retain the publisher’s signing identity. Local debug APKs use a different signer and cannot receive production-signed updates in place.
 
+## 1.4.3 changes
+
+The terminal screen uses a quieter Android-style hierarchy: a compact app bar, one uncluttered paper reading surface, 16px monospace text with system font scaling, consistent 16dp side spacing, a native 16sp multiline field and one prominent **Send** action. Secondary shortcuts have at least 48dp touch targets and disappear while the soft keyboard is visible; they return when it closes. Keyboard visibility and safe areas use AndroidX IME insets, not input focus or guessed keyboard heights. Reading history and **↓ Latest** remain available.
+
+Design references: [Android accessibility and touch targets](https://developer.android.com/guide/topics/ui/accessibility/apps), [Material typography and color roles](https://developer.android.com/develop/ui/compose/designsystems/material3#typography), and [Android software keyboard/insets](https://developer.android.com/develop/ui/views/layout/sw-keyboard). These principles are applied to the existing native Views; no Compose migration or new UI dependency.
+
 ## 1.4.2 changes
 
 The terminal uses a warm paper-and-ink linework theme with fine registration arcs and a ruled reading margin. Desktop colors become contrast-checked sage, coral, blue, violet and ochre inks with pale highlight fields rather than white text on a dark surface. Long lines wrap to the phone width; explicit line breaks, emphasis and full scrollback remain intact. Scrolling up preserves your reading position during refresh, **↓ Latest** restores tail-following, and the multiline composer stays above the keyboard.

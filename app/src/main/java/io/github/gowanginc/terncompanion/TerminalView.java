@@ -2,8 +2,11 @@ package io.github.gowanginc.terncompanion;
 
 import android.annotation.SuppressLint;
 import android.content.Context;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.os.Build;
 import android.util.AttributeSet;
 import android.view.Gravity;
@@ -67,10 +70,9 @@ public final class TerminalView extends FrameLayout {
             + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0,"
             + " maximum-scale=10.0, user-scalable=yes\">"
             + "<style>html,body{margin:0;padding:0;background:" + BG + ";overflow:auto}"
-            + "body{box-sizing:border-box;border-left:1px solid #d5dfd3;border-right:1px solid #d5dfd3;}"
-            + "pre{font-family:monospace;font-size:14px;line-height:1.45;white-space:pre-wrap;"
-            + "overflow-wrap:anywhere;margin:0;padding:10px 12px;color:" + INK + ";}"
-            + "#t{border-left:1px solid #b4c8b7;margin-left:5px;}"
+            + "pre{margin:0;padding:0;font-family:monospace;font-size:16px;line-height:1.5;"
+            + "white-space:pre-wrap;overflow-wrap:anywhere;color:" + INK + ";}"
+            + "#t pre{font:inherit;margin:0;padding:0;}"
             + "::selection{background:#d5e2d5;color:" + INK + ";}</style></head><body>";
     private static final String SHELL_SCRIPT =
             "<script>function tSet(h){document.getElementById('t').innerHTML=h;}</script>";
@@ -97,9 +99,9 @@ public final class TerminalView extends FrameLayout {
         density = context.getResources().getDisplayMetrics().density;
         webView = new WebView(context);
         FrameLayout.LayoutParams terminal = new FrameLayout.LayoutParams(-1, -1);
-        terminal.setMargins(dp(6), dp(4), dp(6), dp(4));
+        terminal.setMargins(dp(16), dp(12), dp(16), dp(12));
         addView(webView, terminal);
-        setBackground(LineworkUi.cardBackground(context, Color.parseColor(BG), 0xffb4c8b7));
+        setBackgroundColor(Color.parseColor(BG));
 
         jumpFab = new Button(context);
         jumpFab.setText("↓ Latest");
@@ -109,13 +111,17 @@ public final class TerminalView extends FrameLayout {
         jumpFab.setTypeface(Typeface.DEFAULT_BOLD);
         jumpFab.setMinHeight(dp(48));
         jumpFab.setPadding(dp(14), 0, dp(14), 0);
-        jumpFab.setBackground(LineworkUi.cardBackground(context, 0xff17634e, 0xff172622));
+        GradientDrawable pill = new GradientDrawable();
+        pill.setShape(GradientDrawable.RECTANGLE);
+        pill.setCornerRadius(dp(24));
+        pill.setColor(0xff17634e);
+        jumpFab.setBackground(new RippleDrawable(ColorStateList.valueOf(0x33ffffff), pill, null));
         jumpFab.setVisibility(GONE);
         jumpFab.setContentDescription("Jump to the latest terminal output");
         jumpFab.setOnClickListener(v -> scrollToTail());
         FrameLayout.LayoutParams fab = new FrameLayout.LayoutParams(-2, dp(48),
                 Gravity.BOTTOM | Gravity.END);
-        fab.setMargins(0, 0, dp(12), dp(12));
+        fab.setMargins(0, 0, dp(16), dp(12));
         addView(jumpFab, fab);
 
         WebSettings ws = webView.getSettings();
@@ -129,6 +135,8 @@ public final class TerminalView extends FrameLayout {
         ws.setDisplayZoomControls(false);
         ws.setUseWideViewPort(false); // keep the phone width as the line-wrapping width.
         ws.setLoadWithOverviewMode(false);
+        // Honour the system font scale; pinch-zoom stays available (not locked).
+        ws.setTextZoom(Math.round(100f * context.getResources().getConfiguration().fontScale));
         if (Build.VERSION.SDK_INT >= 26) ws.setSafeBrowsingEnabled(true);
 
         webView.setWebViewClient(new WebViewClient() {
