@@ -10,6 +10,7 @@ import android.graphics.drawable.RippleDrawable;
 import android.os.Build;
 import android.util.AttributeSet;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
@@ -84,10 +85,15 @@ public final class TerminalView extends FrameLayout {
     private final WebView webView;
     private final Button jumpFab;
     private final float density;
+    private final float fontScale;
     private OnTailChangeListener tailListener;
     private boolean loaded;
     private boolean showsPlain;
     private String lastFragment = "";
+    private int textSizeSp = 16;
+    private float sizeRatio;
+    private boolean resizingText;
+    private boolean resizeAtTail;
 
     public TerminalView(Context context) {
         this(context, null);
@@ -97,6 +103,7 @@ public final class TerminalView extends FrameLayout {
     public TerminalView(Context context, AttributeSet attrs) {
         super(context, attrs);
         density = context.getResources().getDisplayMetrics().density;
+        fontScale = context.getResources().getConfiguration().fontScale;
         webView = new WebView(context);
         FrameLayout.LayoutParams terminal = new FrameLayout.LayoutParams(-1, -1);
         terminal.setMargins(dp(16), dp(12), dp(16), dp(12));
@@ -135,8 +142,9 @@ public final class TerminalView extends FrameLayout {
         ws.setDisplayZoomControls(false);
         ws.setUseWideViewPort(false); // keep the phone width as the line-wrapping width.
         ws.setLoadWithOverviewMode(false);
-        // Honour the system font scale; pinch-zoom stays available (not locked).
-        ws.setTextZoom(Math.round(100f * context.getResources().getConfiguration().fontScale));
+        // Honour the reader's size and the system font scale; pinch-zoom stays
+        // available (not locked).
+        applyReaderTextZoom();
         if (Build.VERSION.SDK_INT >= 26) ws.setSafeBrowsingEnabled(true);
 
         webView.setWebViewClient(new WebViewClient() {
@@ -164,6 +172,13 @@ public final class TerminalView extends FrameLayout {
             }
         });
         webView.setOnScrollChangeListener((v, x, y, oldX, oldY) -> scheduleTailCheck());
+        webView.setOnTouchListener((v, event) -> {
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                webView.removeCallbacks(sizeRestore);
+                resizingText = false;
+            }
+            return false;
+        });
         webView.setBackgroundColor(Color.parseColor(BG));
     }
 
@@ -194,7 +209,9 @@ public final class TerminalView extends FrameLayout {
             return;
         }
         if (fragment.equals(lastFragment)) return; // refresh only when content changed
-        boolean tail = isAtTail();
+        boolean tail = resizingText ? resizeAtTail : isAtTail();
+        webView.removeCallbacks(sizeRestore); // new layout makes a queued ratio stale
+        resizingText = false;
         lastFragment = fragment;
         webView.evaluateJavascript("tSet(" + JSONObject.quote(fragment) + ")", null);
         if (tail) webView.postDelayed(this::scrollToTail, TAIL_SETTLE_MS);
@@ -224,11 +241,55 @@ public final class TerminalView extends FrameLayout {
 
     /** Jumps to the bottom edge of the capture. */
     public void scrollToTail() {
+        webView.removeCallbacks(sizeRestore); // an explicit jump beats a queued resize restore
+        resizingText = false;
         // Large but finite: Integer.MAX_VALUE is stored unclamped by WebView and
         // overflows position arithmetic (MAX + height goes negative).
         webView.scrollTo(0, 1 << 22);
         scheduleTailCheck();
     }
+
+    /** Sets the reader's base font size in scaled pixels; the system font scale
+     *  still multiplies it. Keeps the loaded capture, follows the tail for a
+     *  reader who was at the tail, and keeps approximately the same reading
+     *  position for one who was reading history. */
+    public void setTextSizeSp(int sizeSp) {
+        int clamped = Math.max(12, Math.min(24, sizeSp));
+        if (clamped == textSizeSp) return;
+        if (!resizingText) {
+            resizeAtTail = isAtTail();
+            int contentH = Math.round(webView.getContentHeight() * webView.getScale());
+            int scrollRange = Math.max(0, contentH - webView.getHeight());
+            sizeRatio = scrollRange > 0 ? (float) webView.getScrollY() / scrollRange : 0f;
+        }
+        resizingText = true;
+        textSizeSp = clamped;
+        applyReaderTextZoom();
+        // Coalesce slider changes; keep the original tail/history intent until layout settles.
+        webView.removeCallbacks(sizeRestore);
+        webView.postDelayed(sizeRestore, TAIL_SETTLE_MS);
+    }
+
+    /** Text zoom from the reader's size over the 16px CSS baseline, times the OS font scale. */
+    private void applyReaderTextZoom() {
+        webView.getSettings().setTextZoom(Math.round(100f * (textSizeSp / 16f) * fontScale));
+    }
+
+    // Re-anchors the reading position once the resized text has reflowed.
+    private final Runnable sizeRestore = new Runnable() {
+        @Override public void run() {
+            resizingText = false;
+            if (resizeAtTail) {
+                scrollToTail();
+                return;
+            }
+            int contentH = Math.round(webView.getContentHeight() * webView.getScale());
+            if (contentH <= 0) return;
+            int scrollRange = Math.max(0, contentH - webView.getHeight());
+            webView.scrollTo(0, Math.round(sizeRatio * scrollRange));
+            scheduleTailCheck();
+        }
+    };
 
     public void setOnTailChangeListener(OnTailChangeListener listener) {
         tailListener = listener;

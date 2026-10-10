@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
 import android.graphics.Canvas;
 import android.graphics.Paint;
@@ -31,6 +32,7 @@ import android.widget.EditText;
 import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.TextView;
 
 import androidx.core.graphics.Insets;
@@ -68,11 +70,16 @@ public final class MainActivity extends Activity {
     private static final int CORAL = 0xffb95743;
     private static final int OCHRE = 0xffb58a37;
     private static final Pattern SESSION_NAME = Pattern.compile("[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}");
+    private static final String TEXT_SIZE_KEY = "terminal_text_size_sp";
+    private static final int TEXT_SIZE_DEFAULT = 16;
+    private static final int TEXT_SIZE_MIN = 12;
+    private static final int TEXT_SIZE_MAX = 24;
 
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final ArrayList<Host> hosts = new ArrayList<>();
     private HostStore store;
+    private SharedPreferences preferences;
     private LinearLayout root;
     private TextView status;
     private Runnable refreshTick;
@@ -88,6 +95,7 @@ public final class MainActivity extends Activity {
         super.onCreate(state);
         Log.i(TAG, "TernCompanion " + BuildConfig.VERSION_NAME + " (" + BuildConfig.VERSION_CODE + ") starting");
         store = new HostStore(this);
+        preferences = getSharedPreferences("tern_ui", MODE_PRIVATE);
         getWindow().setStatusBarColor(Color.TRANSPARENT);
         getWindow().setNavigationBarColor(Color.TRANSPARENT);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
@@ -190,10 +198,72 @@ public final class MainActivity extends Activity {
         updates.setOnClickListener(v -> AppUpdater.show(this, io));
         page.addView(updates, mp(-1, -2, 0, 8, 0, 12));
 
+        Button settings = button("Settings");
+        settings.setOnClickListener(v -> showSettings(null));
+        page.addView(settings, mp(-1, -2, 0, 8, 0, 12));
+
         status = note("", 13);
         page.addView(status, mp(-1, -2, 0, 16, 0, 0));
         page.addView(footnote());
         status("Funnel HTTPS: 8443. Private HTTP: 9260. Cloudflare Access is a separate option.");
+    }
+
+    private int terminalTextSize() {
+        return Math.max(TEXT_SIZE_MIN, Math.min(TEXT_SIZE_MAX,
+                preferences.getInt(TEXT_SIZE_KEY, TEXT_SIZE_DEFAULT)));
+    }
+
+    private void showSettings(TerminalView pane) {
+        InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (imm != null) imm.hideSoftInputFromWindow(root.getWindowToken(), 0);
+
+        int currentSize = terminalTextSize();
+        LinearLayout fields = column();
+        fields.setPadding(dp(24), dp(8), dp(24), dp(16));
+        TextView sizeLabel = text("Terminal text size: " + currentSize + " sp", 16,
+                INK, Typeface.DEFAULT, Typeface.BOLD);
+        fields.addView(sizeLabel);
+        SeekBar size = new SeekBar(this);
+        size.setId(View.generateViewId());
+        sizeLabel.setLabelFor(size.getId());
+        size.setContentDescription("Terminal text size");
+        size.setMin(TEXT_SIZE_MIN);
+        size.setMax(TEXT_SIZE_MAX);
+        size.setProgress(currentSize);
+        size.setKeyProgressIncrement(1);
+        size.setProgressTintList(ColorStateList.valueOf(GREEN));
+        size.setThumbTintList(ColorStateList.valueOf(GREEN));
+        ViewCompat.setStateDescription(size, currentSize + " sp");
+        fields.addView(size, mp(-1, dp(48), 0, 8, 0, 8));
+        TextView preview = text("The quick brown fox\njumps over the lazy dog.\n0123456789",
+                currentSize, INK, Typeface.MONOSPACE);
+        preview.setContentDescription("Terminal text size preview");
+        preview.setLineSpacing(0, 1.5f);
+        preview.setPadding(dp(16), dp(12), dp(16), dp(12));
+        preview.setBackgroundColor(PAPER);
+        fields.addView(preview, new LinearLayout.LayoutParams(-1, -2));
+        fields.addView(note("Changes apply immediately and are saved on this phone. Android’s system text size also applies.", 14),
+                mp(-1, -2, 0, 16, 0, 0));
+        size.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar bar, int value, boolean fromUser) {
+                sizeLabel.setText("Terminal text size: " + value + " sp");
+                ViewCompat.setStateDescription(bar, value + " sp");
+                preview.setTextSize(value);
+                if (pane != null) pane.setTextSizeSp(value);
+            }
+            @Override public void onStartTrackingTouch(SeekBar bar) {}
+            @Override public void onStopTrackingTouch(SeekBar bar) {}
+        });
+        ScrollView form = new ScrollView(this);
+        form.addView(fields);
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Settings").setView(form)
+                .setPositiveButton("Done", null)
+                .setNeutralButton("Reset", (d, which) -> size.setProgress(TEXT_SIZE_DEFAULT))
+                .create();
+        dialog.setOnDismissListener(d -> preferences.edit().putInt(TEXT_SIZE_KEY, size.getProgress()).apply());
+        dialog.show();
+        dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
     }
 
     private void connect(Host h) {
@@ -398,6 +468,15 @@ public final class MainActivity extends Activity {
 
         // 2. Terminal pane: takes all remaining height, IME on or off.
         final TerminalView pane = new TerminalView(this);
+        pane.setTextSizeSp(terminalTextSize());
+        Button settingsBtn = smallButton("Aa");
+        settingsBtn.setTextSize(16);
+        settingsBtn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        settingsBtn.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2217634e),
+                null, bg(Color.WHITE, Color.TRANSPARENT)));
+        settingsBtn.setContentDescription("Settings");
+        settingsBtn.setOnClickListener(v -> showSettings(pane));
+        header.addView(settingsBtn, new LinearLayout.LayoutParams(dp(48), dp(48)));
         page.addView(pane, new LinearLayout.LayoutParams(-1, 0, 1));
 
         // One shared error/status line, hidden unless something is wrong.

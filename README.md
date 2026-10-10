@@ -112,6 +112,12 @@ For manual pairing, tap **Add a PC**. Supply the name, hostname or IP, separate 
 
 Cloudflare Access is optional. Configure its tunnel and service token separately. Supply both Access credentials as well as the bridge token. The app does not forward credentials through redirects.
 
+## Settings
+
+Tap **Settings** on the PC-list screen, or **Aa** in a live terminal’s app bar. Adjust **Terminal text size** from 12–24sp (default 16sp). The preview and open terminal resize immediately, without reloading the capture or clearing your draft. **Done**, Back or dismissing the dialog saves the choice on the phone; **Reset** returns to 16sp.
+
+Android’s system font scale also applies. The header, composer and other native controls continue to use the system setting.
+
 ## App updates
 
 Tap **App updates** on the computer-list screen. The app checks the latest published stable release from this repository without authentication.
@@ -150,7 +156,19 @@ python3 checks/run_all.py --sdk "$ANDROID_HOME" --serial YOUR_ADB_SERIAL
 
 The Android checks run against the built APK with synthetic data. They do not read your saved pairing files or change saved computers. The runner reports when Android checks were not run.
 
+For the font-settings UI regression, use an isolated test device with the app installed:
+
+```sh
+python3 checks/check_terminal_settings.py --serial YOUR_ADB_SERIAL
+```
+
+This exercises the native slider, preview, persistence and reset, restores the original font size, and force-stops the app. It does not change saved PCs or open backend sessions.
+
 A release APK must retain the publisher’s signing identity. Local debug APKs use a different signer and cannot receive production-signed updates in place.
+
+## 1.4.4 changes
+
+Added saved terminal text-size settings with a native accessible slider, live preview and reset. Open them from the PC list or the terminal’s **Aa** button. Text resizing preserves the capture, history and tail-follow intent; keyboard-aware shortcuts and the native composer are unchanged.
 
 ## 1.4.3 changes
 
