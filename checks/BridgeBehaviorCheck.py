@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Run with python3 checks/BridgeBehaviorCheck.py (no installed Tern required).
 
-HTTP checks model a live terminal's visible native surface and input state, not
-CLI output echoes. Runner checks use real disposable Python child processes.
-The release integration harness separately exercises the installed Tern CLI.
+HTTP checks model a live terminal's finite visible native surface, its scrollback
+history and its live session/agent state — never a CLI argv echo. Runner checks
+use real disposable Python child processes. The release integration harness
+separately exercises the installed Tern CLI.
 """
 import contextlib
+from html import escape
 import http.client
 import io
 import json
@@ -25,18 +27,59 @@ import tern_bridge as bridge
 
 
 class Terminal:
-    """Functional boundary double: input changes state, capture reads a surface."""
+    """Functional boundary double: a finite visible native surface plus scrollback.
+
+    Input changes screen and session state; capture reads the modeled surface.
+    Nothing here reports an argv echo as an outcome: callers observe what a phone
+    would see — painted rows, styled HTML and created agent sessions.
+    """
+
+    TEXT_COLOR = "#f0e8f4"      # desktop surface palette (body text and background)
+    BACKGROUND = "#140f18"
+    PROMPT_COLOR = "#8eb897"
+    VISIBLE_ROWS = 2            # only the newest rows fit the physical screen
 
     def __init__(self):
-        self.old_shell = "PREVIOUS_SHELL_SYNTHETIC\n"
-        self.visible = "ACTIVE_NATIVE_SYNTHETIC\nUnicode: café 世界\n"
+        self.old_shell = "PREVIOUS_SHELL_SYNTHETIC\n"   # raw PTY grid; OMP paints over it
+        self.history = [(self.TEXT_COLOR, "earlier synthetic output line\n")]
+        self.visible = [(self.PROMPT_COLOR, "ACTIVE_NATIVE_SYNTHETIC\n"),
+                        (self.TEXT_COLOR, "Unicode: café 世界\n")]
+        self.sessions = {}
         self.pending = ""
         self.submitted = []
         self.pasted = []
-        self.new_sessions = []
         self.model_cycles = 0
         self.operations = 0
         self.failure = None
+
+    def _rows(self, scrollback):
+        return self.history + self.visible if scrollback else list(self.visible)
+
+    def screen(self, scrollback=False):
+        """Plain text as `capture ... --surfaces` (plus `--scrollback`) returns it."""
+        return "".join(text for _, text in self._rows(scrollback))
+
+    def styled(self, scrollback=False):
+        """The same surface as `capture ... --html` paints it: escaped text, palette spans."""
+        spans = "".join('<span style="color:%s">%s</span>' % (color, escape(text))
+                        for color, text in self._rows(scrollback))
+        return '<pre style="color:%s;background-color:%s">%s</pre>' % (
+            self.TEXT_COLOR, self.BACKGROUND, spans)
+
+    def _paint(self, line):
+        """Print one line; the oldest visible row scrolls off into scrollback history."""
+        self.visible.append((self.TEXT_COLOR, line + "\n"))
+        while len(self.visible) > self.VISIBLE_ROWS:
+            self.history.append(self.visible.pop(0))
+
+    def new_session(self, args):
+        """Interpret `new session NAME [--cwd DIR] -- CMD` into live session state."""
+        state = {"cwd": None, "command": "login shell"}
+        if "--cwd" in args:
+            state["cwd"] = args[args.index("--cwd") + 1]
+        if "--" in args and args.index("--") + 1 < len(args):
+            state["command"] = args[args.index("--") + 1]
+        self.sessions[args[2]] = state
 
     def run(self, args, stdin_text=None):
         self.operations += 1
@@ -44,16 +87,21 @@ class Terminal:
             raise self.failure
         command = args[0]
         if command == "ls":
-            return 0, json.dumps({"sessions": []})
+            sessions = [{"name": name, **state} for name, state in sorted(self.sessions.items())]
+            return 0, json.dumps({"sessions": sessions})
         if command == "new":
-            self.new_sessions.append(list(args))
+            self.new_session(args)
             return 0, ""
         if command == "kill":
+            self.sessions.pop(args[2], None)
             return 0, ""
         if args[1] not in ("42", "qa/42", "Flow - demo/42"):
             raise RuntimeError("unknown synthetic block")
         if command == "capture":
-            return 0, self.visible if "--surfaces" in args[2:] else self.old_shell
+            if "--surfaces" not in args:
+                return 0, self.old_shell
+            scrollback = "--scrollback" in args
+            return 0, self.styled(scrollback) if "--html" in args else self.screen(scrollback)
         if command != "send":
             raise RuntimeError("unsupported synthetic operation")
         kind, value = args[2:4]
@@ -61,6 +109,7 @@ class Terminal:
             for char in value:
                 if char == "\r":
                     self.submitted.append(self.pending)
+                    self._paint(self.pending)
                     self.pending = ""
                 else:
                     self.pending += char
@@ -72,6 +121,7 @@ class Terminal:
                 self.model_cycles += 1
             elif value == "Enter":
                 self.submitted.append(self.pending)
+                self._paint(self.pending)
                 self.pending = ""
             else:
                 raise RuntimeError("unsupported synthetic key")
@@ -115,14 +165,60 @@ class BridgeHttpChecks(unittest.TestCase):
     def send(self, kind, value, block="42"):
         return self.request("/send", {"block": block, "kind": kind, "value": value})[0]
 
-    def test_capture_reads_active_native_surface_as_utf8(self):
+    def test_default_text_capture_is_readable_and_includes_scrollback(self):
         status, content_type, body = self.request("/capture", {"block": "qa/42"})
         self.assertEqual(status, 200)
         self.assertEqual(content_type, "text/plain; charset=utf-8")
-        self.assertEqual(body.decode("utf-8"), self.terminal.visible)
-        self.assertNotIn(self.terminal.old_shell.encode(), body)
-        self.terminal.visible = "NEXT_NATIVE_FRAME\n"
-        self.assertEqual(self.request("/capture", {"block": "42"})[2], b"NEXT_NATIVE_FRAME\n")
+        text = body.decode("utf-8")
+        self.assertIn("ACTIVE_NATIVE_SYNTHETIC", text)
+        self.assertIn("Unicode: café 世界", text)
+        self.assertIn("earlier synthetic output line", text)
+        self.assertLess(text.index("earlier synthetic"), text.index("ACTIVE_NATIVE_SYNTHETIC"))
+        self.assertNotIn("<pre", text)
+        self.assertNotIn(self.terminal.old_shell.encode("utf-8"), body)
+        self.assertEqual(self.terminal.operations, 1)
+
+    def test_capture_reads_the_current_surface_frame_as_utf8(self):
+        self.terminal.visible = [(self.terminal.TEXT_COLOR, "NEXT_NATIVE_FRAME\n"),
+                                 (self.terminal.TEXT_COLOR, "Unicode: 世界 café\n")]
+        status, content_type, body = self.request("/capture", {"block": "42"})
+        self.assertEqual(status, 200)
+        self.assertEqual(content_type, "text/plain; charset=utf-8")
+        self.assertIn("NEXT_NATIVE_FRAME\nUnicode: 世界 café\n", body.decode("utf-8"))
+        self.assertNotIn(b"ACTIVE_NATIVE_SYNTHETIC", body)
+
+    def test_html_capture_preserves_escaped_user_text_and_desktop_palette(self):
+        typed = "<b>&</b> synthetic"
+        self.assertEqual(self.send("submit", typed), 200)
+        status, content_type, body = self.request("/capture", {"block": "42", "format": "html"})
+        self.assertEqual(status, 200)
+        self.assertEqual(content_type, "text/html; charset=utf-8")
+        page = body.decode("utf-8")
+        self.assertTrue(page.startswith('<pre style="color:#f0e8f4;background-color:#140f18">'))
+        self.assertIn('<span style="color:#8eb897">ACTIVE_NATIVE_SYNTHETIC\n</span>', page)
+        self.assertNotIn(typed, page)
+        self.assertIn("&lt;b&gt;&amp;&lt;/b&gt; synthetic", page)
+        self.assertIn("earlier synthetic output line", page)   # html keeps scrollback too
+        self.assertNotIn(self.terminal.old_shell, page)
+        self.assertEqual(self.terminal.operations, 2)
+
+    def test_finite_visible_screen_versus_unbounded_scrollback(self):
+        for line in ["first synthetic command", "second synthetic command", "third synthetic command"]:
+            self.assertEqual(self.send("submit", line), 200)
+        visible_only = self.terminal.run(["capture", "42", "--surfaces"])[1]
+        self.assertNotIn("first synthetic command", visible_only)
+        self.assertIn("third synthetic command", visible_only)
+        scrolled = self.terminal.run(["capture", "42", "--scrollback", "--surfaces"])[1]
+        self.assertIn("first synthetic command", scrolled)
+        status, _, body = self.request("/capture", {"block": "42"})
+        self.assertEqual(status, 200)
+        self.assertIn(b"first synthetic command", body)
+
+    def test_formats_other_than_text_or_html_are_rejected_before_the_cli(self):
+        for fmt in ["xml", "HTML", "ansi", "", 42, None, True, {}, []]:
+            with self.subTest(fmt=fmt):
+                self.assertEqual(self.request("/capture", {"block": "42", "format": fmt})[0], 400)
+        self.assertEqual(self.terminal.operations, 0)
 
     def test_submit_is_one_operation_that_enters_text(self):
         self.assertEqual(self.send("submit", "synthetic café"), 200)
@@ -135,7 +231,7 @@ class BridgeHttpChecks(unittest.TestCase):
         self.assertEqual(self.terminal.submitted, ["Flow command"])
         status, _, screen = self.request("/capture", {"block": "Flow - demo/42"})
         self.assertEqual(status, 200)
-        self.assertEqual(screen.decode("utf-8"), self.terminal.visible)
+        self.assertIn("Flow command", screen.decode("utf-8"))
 
     def test_text_paste_and_enter_keep_distinct_semantics(self):
         self.assertEqual(self.send("text", "raw"), 200)
@@ -246,26 +342,34 @@ class BridgeHttpChecks(unittest.TestCase):
             self.assertEqual(self.request("/new", {"name": "qa", "cwd": cwd})[0], 400)
         self.assertEqual(self.terminal.operations, 0)
 
-    def test_new_session_creates_named_session(self):
+    def test_new_session_starts_an_omp_agent_named_by_the_request(self):
         status, content_type, body = self.request("/new", {"name": "qa-42"})
         self.assertEqual(status, 200)
         self.assertEqual(content_type, "application/json")
         self.assertEqual(json.loads(body), {"ok": True})
-        self.assertEqual(self.terminal.new_sessions, [["new", "session", "qa-42"]])
-        self.assertEqual(self.terminal.operations, 1)
+        self.assertEqual(self.terminal.sessions, {"qa-42": {"cwd": None, "command": "omp"}})
+        # The phone's own session list is what proves live agent state, not an argv echo.
+        listed = json.loads(self.request("/sessions", method="GET")[2])["sessions"]
+        self.assertEqual(listed, [{"name": "qa-42", "cwd": None, "command": "omp"}])
 
-    def test_new_session_passes_absolute_cwd_and_omits_it_when_absent(self):
+    def test_new_session_cwd_reaches_the_created_agent(self):
         self.assertEqual(self.request("/new", {"name": "qa-42", "cwd": "/tmp/qa"})[0], 200)
-        self.assertEqual(self.terminal.new_sessions, [["new", "session", "qa-42", "--cwd", "/tmp/qa"]])
-        # An absent or empty cwd means "inherit the bridge's directory": no --cwd argument.
-        self.assertEqual(self.request("/new", {"name": "qa-42"})[0], 200)
-        self.assertEqual(self.request("/new", {"name": "qa-42", "cwd": ""})[0], 200)
-        self.assertEqual(self.terminal.new_sessions[1:], [["new", "session", "qa-42"]] * 2)
+        self.assertEqual(self.terminal.sessions["qa-42"], {"cwd": "/tmp/qa", "command": "omp"})
+        # An absent or empty cwd means "inherit the bridge's directory".
+        self.assertEqual(self.request("/new", {"name": "qa-43"})[0], 200)
+        self.assertEqual(self.request("/new", {"name": "qa-44", "cwd": ""})[0], 200)
+        self.assertIsNone(self.terminal.sessions["qa-43"]["cwd"])
+        self.assertIsNone(self.terminal.sessions["qa-44"]["cwd"])
 
     def test_new_session_accepts_maximum_length_name(self):
         longest = "a" * 64
         self.assertEqual(self.request("/new", {"name": longest})[0], 200)
-        self.assertEqual(self.terminal.new_sessions, [["new", "session", longest]])
+        self.assertEqual(self.terminal.sessions[longest], {"cwd": None, "command": "omp"})
+
+    def test_kill_session_removes_the_named_agent(self):
+        self.assertEqual(self.request("/new", {"name": "qa-42"})[0], 200)
+        self.assertEqual(self.request("/kill", {"session": "qa-42"})[0], 200)
+        self.assertEqual(self.terminal.sessions, {})
 
     def test_new_session_rejections_never_reach_cli(self):
         for name in ["Flow - demo", "", "a" * 65, "-qa", "qa/42", "qa\0", None, 42]:
@@ -274,12 +378,12 @@ class BridgeHttpChecks(unittest.TestCase):
         for cwd in ["relative/path", "/a/../b", "/tmp\0qa", "/" + "a" * 4096, 42]:
             with self.subTest(cwd=cwd):
                 self.assertEqual(self.request("/new", {"name": "qa-42", "cwd": cwd})[0], 400)
-        self.assertEqual(self.terminal.new_sessions, [])
+        self.assertEqual(self.terminal.sessions, {})
         self.assertEqual(self.terminal.operations, 0)
 
     def test_new_session_requires_authorization(self):
         self.assertEqual(self.request("/new", {"name": "qa-42"}, auth=False)[0], 401)
-        self.assertEqual(self.terminal.new_sessions, [])
+        self.assertEqual(self.terminal.sessions, {})
         self.assertEqual(self.terminal.operations, 0)
 
     def test_cli_errors_are_returned_for_post_and_get(self):

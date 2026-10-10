@@ -123,7 +123,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/send":
                 self._send(200, self._send_keys(body))
             elif self.path == "/capture":
-                self._send(200, self._capture(body), content_type="text/plain; charset=utf-8")
+                fmt = self._capture_format(body)
+                content_type = "text/html; charset=utf-8" if fmt == "html" else "text/plain; charset=utf-8"
+                self._send(200, self._capture(body, fmt), content_type=content_type)
             elif self.path == "/new":
                 self._send(200, self._new_session(body))
             elif self.path == "/kill":
@@ -187,11 +189,23 @@ class Handler(BaseHTTPRequestHandler):
         text.encode("utf-8")  # Reject lone JSON surrogate escapes before invoking the CLI.
         return text
 
-    def _capture(self, body: dict) -> bytes:
+    def _capture_format(self, body: dict) -> str:
+        fmt = body.get("format", "text")
+        if fmt not in ("text", "html"):
+            raise ValueError("format must be text or html")
+        return fmt
+
+    def _capture(self, body: dict, fmt: str) -> bytes:
         block = self._block(body)
         # OMP paints a native Tern surface, not the underlying shell/ANSI grid.
-        # --surfaces extracts its current main-region text through the public CLI.
-        _, out = run_tern(["capture", block, "--surfaces"])
+        # --surfaces extracts its current main-region text through the public CLI;
+        # --html returns that surface as styled HTML for phone rendering, and
+        # --scrollback adds output that has scrolled off the visible screen.
+        args = ["capture", block]
+        if fmt == "html":
+            args.append("--html")
+        args += ["--scrollback", "--surfaces"]
+        _, out = run_tern(args)
         return out.encode("utf-8")
 
     def _new_session(self, body: dict) -> dict:
@@ -207,7 +221,8 @@ class Handler(BaseHTTPRequestHandler):
             c = cwd
             c.encode("utf-8")
             args += ["--cwd", c]
-        run_tern(args)
+        # New sessions default to OMP, not the bare login shell.
+        run_tern(args + ["--", "omp"])
         return {"ok": True}
 
     def _kill_session(self, body: dict) -> dict:

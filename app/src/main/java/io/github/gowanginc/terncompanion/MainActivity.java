@@ -16,15 +16,19 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.text.InputType;
 import android.text.TextUtils;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -50,6 +54,7 @@ import java.util.regex.Pattern;
  * Cloudflare Access HTTPS, or a private LAN/Tailscale connection.
  */
 public final class MainActivity extends Activity {
+    private static final String TAG = "TernCompanion";
     private static final int INK = 0xff172622;
     private static final int MUTED = 0xff68736d;
     private static final int PAPER = 0xfff5f2e9;
@@ -75,6 +80,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
+        Log.i(TAG, "TernCompanion " + BuildConfig.VERSION_NAME + " (" + BuildConfig.VERSION_CODE + ") starting");
         store = new HostStore(this);
         getWindow().setStatusBarColor(Color.TRANSPARENT);
         getWindow().setNavigationBarColor(Color.TRANSPARENT);
@@ -129,6 +135,7 @@ public final class MainActivity extends Activity {
 
     private void showHosts() {
         screen = "hosts";
+        Log.d(TAG, "screen hosts");
         stopTick();
         root.removeAllViews();
         ScrollView scroll = paddedScroll();
@@ -206,6 +213,7 @@ public final class MainActivity extends Activity {
 
     private void showSessions(Host h, JSONArray sessions) {
         screen = "sessions";
+        Log.d(TAG, "screen sessions");
         stopTick();
         lastHost = h;
         lastSessions = sessions;
@@ -271,6 +279,7 @@ public final class MainActivity extends Activity {
 
         AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("New session")
+                .setMessage("Creates a session that starts OMP — the same desktop agent interface — so it is ready to drive from this app.")
                 .setView(form)
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Create", null)
@@ -349,130 +358,148 @@ public final class MainActivity extends Activity {
 
     private void showBlock(Host h, String sessionName, String blockId, String label) {
         screen = "block";
+        Log.d(TAG, "screen block");
         stopTick();
         final int gen = viewGen;
         root.removeAllViews();
-        ScrollView scroll = paddedScroll();
-        LinearLayout page = pageIn(scroll);
-        page.addView(headerWithBack(label, () -> connect(h)));
-        page.addView(brow("LIVE SCREEN"), mp(-1, -2, 0, 18, 0, 0));
 
-        TextView termScreen = text("", 12, INK, Typeface.MONOSPACE);
-        termScreen.setBackground(bg(0xff101b16, 0xff101b16));
-        termScreen.setTextColor(0xffd7e4dc);
-        termScreen.setPadding(dp(18), dp(18), dp(18), dp(18));
-        ScrollView screenScroll = new ScrollView(this);
-        screenScroll.addView(termScreen);
-        page.addView(screenScroll, mp(-1, dp(250), 0, 12, 0, 0));
+        // Fixed chrome around an expanding terminal: no outer ScrollView, nothing
+        // that fights the pane's own vertical and horizontal touch scrolling.
+        LinearLayout page = column();
+        root.addView(page, new LinearLayout.LayoutParams(-1, -1));
 
-        TextView captureNote = text("", 12, CORAL, Typeface.MONOSPACE);
+        // 1. Compact header (52dp): back, block label, live marker.
+        LinearLayout header = row();
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setPadding(dp(6), 0, dp(12), 0);
+        header.setBackground(LineworkUi.cardBackground(this, CARD, EDGE));
+        Button backBtn = smallButton("‹");
+        backBtn.setTextSize(24);
+        backBtn.setContentDescription("Back");
+        backBtn.setOnClickListener(v -> connect(h));
+        header.addView(backBtn, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        TextView headLabel = text(label, 17, INK, Typeface.SERIF, Typeface.BOLD);
+        headLabel.setSingleLine(true);
+        headLabel.setEllipsize(TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams headLp = weight1();
+        headLp.leftMargin = dp(8);
+        header.addView(headLabel, headLp);
+        TextView live = text("LIVE", 10, GREEN, Typeface.MONOSPACE, Typeface.BOLD);
+        live.setLetterSpacing(0.10f);
+        header.addView(live);
+        page.addView(header, new LinearLayout.LayoutParams(-1, dp(52)));
+
+        // 2. Terminal pane: takes all remaining height, IME on or off.
+        final TerminalView pane = new TerminalView(this);
+        page.addView(pane, new LinearLayout.LayoutParams(-1, 0, 1));
+
+        // One shared error/status line, hidden unless something is wrong.
+        final TextView captureNote = text("", 12, CORAL, Typeface.MONOSPACE);
         captureNote.setContentDescription("Live screen status");
-        page.addView(captureNote, mp(-1, -2, 0, 8, 0, 24));
+        captureNote.setVisibility(View.GONE);
+        captureNote.setPadding(dp(12), dp(4), dp(12), dp(4));
+        page.addView(captureNote, new LinearLayout.LayoutParams(-1, -2));
+        status = captureNote;
 
-        page.addView(brow("SEND TO TERMINAL"));
-        EditText input = new EditText(this);
-        input.setHint("Type a message…");
-        input.setRawInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
-                | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        // 3. Shortcut strip: one horizontally scrollable row of terminal keys.
+        String[][] keys = {
+                {"Ctrl+P", "ctrl+p"}, {"Ctrl+C", "ctrl+c"}, {"Esc", "Escape"}, {"Tab", "Tab"},
+                {"Enter", "Enter"}, {"↑", "Up"}, {"↓", "Down"}, {"←", "Left"}, {"→", "Right"}};
+        HorizontalScrollView stripScroll = new HorizontalScrollView(this);
+        stripScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout strip = row();
+        strip.setPadding(dp(6), 0, dp(6), 0);
+        for (int i = 0; i < keys.length; i++) {
+            Button k = smallButton(keys[i][0]);
+            String combo = keys[i][1];
+            k.setContentDescription("Send " + combo);
+            k.setOnClickListener(v -> send(h, sessionName, blockId, "keys", combo, null));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(48));
+            if (i > 0) lp.leftMargin = dp(6);
+            strip.addView(k, lp);
+        }
+        stripScroll.addView(strip);
+        page.addView(stripScroll, new LinearLayout.LayoutParams(-1, dp(48)));
+
+        // 4. Pinned composer: native multiline EditText plus an explicit Send.
+        LinearLayout composer = row();
+        composer.setGravity(Gravity.BOTTOM);
+        composer.setPadding(dp(8), dp(6), dp(8), dp(8));
+        composer.setBackground(LineworkUi.cardBackground(this, CARD, EDGE));
+        final EditText input = new EditText(this);
+        input.setHint("Type a command…");
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        input.setImeOptions(EditorInfo.IME_ACTION_NONE); // Enter inserts a newline; Send submits.
         input.setSingleLine(false);
-        input.setMinLines(2);
-        input.setMaxLines(6);
+        input.setMinLines(1);
+        input.setMaxLines(4);
+        input.setMinHeight(dp(48));
         input.setGravity(Gravity.TOP | Gravity.START);
         input.setTextSize(15);
         input.setTextColor(INK);
         input.setHintTextColor(MUTED);
-        input.setPadding(dp(14), dp(14), dp(14), dp(14));
+        input.setPadding(dp(12), dp(10), dp(12), dp(10));
         input.setBackgroundTintList(ColorStateList.valueOf(GREEN));
         input.setContentDescription("Text to send to the terminal");
-        input.setImeOptions(EditorInfo.IME_ACTION_SEND);
-        page.addView(input, mp(-1, -2, 0, 8, 0, 12));
-
-        Button sendButton = button("Send ▸");
+        composer.addView(input, weight1());
+        final Button sendButton = smallButton("Send ▸");
         sendButton.setContentDescription("Send the text and press Enter in the terminal");
-        Button paste = button("Paste");
-        paste.setOnClickListener(v -> {
-            android.content.ClipboardManager cm = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-            if (cm == null || cm.getPrimaryClip() == null || cm.getPrimaryClip().getItemAt(0) == null) return;
-            CharSequence cs = cm.getPrimaryClip().getItemAt(0).coerceToText(this);
-            if (cs != null && cs.length() > 0) send(h, sessionName, blockId, "paste", cs.toString(), null);
-        });
-        sendButton.setOnClickListener(v -> submit(h, sessionName, blockId, input, sendButton));
-        input.setOnEditorActionListener((v, actionId, event) -> {
-            if (actionId != EditorInfo.IME_ACTION_SEND && actionId != EditorInfo.IME_ACTION_DONE) return false;
-            submit(h, sessionName, blockId, input, sendButton);
-            return true;
-        });
-        LinearLayout actions = row();
-        actions.addView(sendButton, new LinearLayout.LayoutParams(0, dp(52), 1));
-        actions.addView(paste, new LinearLayout.LayoutParams(0, dp(52), 1));
-        ((LinearLayout.LayoutParams) paste.getLayoutParams()).leftMargin = dp(8);
-        page.addView(actions, mp(-1, -2, 0, 0, 0, 12));
+        LinearLayout.LayoutParams sendLp = new LinearLayout.LayoutParams(-2, dp(48));
+        sendLp.leftMargin = dp(8);
+        composer.addView(sendButton, sendLp);
+        page.addView(composer, new LinearLayout.LayoutParams(-1, -2));
+        sendButton.setOnClickListener(v -> submitDraft(h, sessionName, blockId, input, sendButton));
 
-        Button cycle = button("Ctrl+P  ·  cycle model");
-        cycle.setContentDescription("Send ctrl+p to cycle the model in this terminal");
-        cycle.setOnClickListener(v -> send(h, sessionName, blockId, "keys", "ctrl+p", null));
-        page.addView(cycle, mp(-1, -2, 0, 0, 0, 12));
+        pane.setOnTailChangeListener(atTail -> pane.setJumpToLatestVisible(!atTail));
 
-        String[][] combos = {{"Enter", "ctrl+c", "Escape", "Tab"}, {"Up", "Down", "Left", "Right"}};
-        for (String[] group : combos) {
-            LinearLayout keys = row();
-            for (int i = 0; i < group.length; i++) {
-                String combo = group[i];
-                Button k = smallButton(combo.equals("ctrl+c") ? "Ctrl+C" : combo.equals("Escape") ? "Esc" : combo);
-                k.setContentDescription("Send " + combo);
-                k.setOnClickListener(v -> send(h, sessionName, blockId, "keys", combo, null));
-                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(48), 1);
-                if (i > 0) lp.leftMargin = dp(6);
-                keys.addView(k, lp);
-            }
-            page.addView(keys, mp(-1, -2, 0, 12, 0, 0));
-        }
-
-        status = note("", 13);
-        page.addView(status, mp(-1, -2, 0, 18, 0, 0));
-        page.addView(footnote());
-
-        // live screen: capture now, then every 2 s while this screen shows
-        Runnable tick = new Runnable() {
+        // Live screen: one capture in flight at a time; the next poll is only
+        // scheduled after the current request completes (no 2s backlog).
+        final Runnable tick = new Runnable() {
             @Override public void run() {
                 io.execute(() -> {
                     try {
-                        HttpResult r = http(h, "POST", "/capture",
-                                body("block", sessionName + "/" + blockId));
-                        if (r.code == 200) {
-                            String captured = trimTail(r.body, 12000);
-                            runUi(() -> {
-                                if (gen != viewGen) return;
-                                termScreen.setText(captured.isEmpty() ? "(no visible output)" : captured);
+                        JSONObject req = new JSONObject()
+                                .put("block", sessionName + "/" + blockId).put("format", "html");
+                        HttpResult r = http(h, "POST", "/capture", req);
+                        runUi(() -> {
+                            if (gen != viewGen) return;
+                            if (r.code == 200) {
                                 captureNote.setText("");
-                            });
-                        } else {
-                            runUi(() -> {
-                                if (gen == viewGen) captureNote.setText("Not live: HTTP " + r.code);
-                            });
-                        }
+                                if (r.isHtml()) pane.loadCapture(r.body);
+                                else pane.loadPlainText(r.body);
+                            } else {
+                                captureNote.setText("Not live: HTTP " + r.code);
+                            }
+                            scheduleNext(gen, this);
+                        });
                     } catch (Exception e) {
                         runUi(() -> {
-                            if (gen == viewGen) captureNote.setText("Screen unavailable: " + shortError(e));
+                            if (gen != viewGen) return;
+                            captureNote.setText("Screen unavailable: " + shortError(e));
+                            scheduleNext(gen, this);
                         });
                     }
                 });
-                if (gen != viewGen) return;
-                refreshTick = this;
-                ui.postDelayed(this, 2000);
             }
         };
         tick.run();
     }
 
-    /** Sends the draft and Enter in one action; keeps the draft when the bridge fails. */
-    private void submit(Host h, String sessionName, String blockId, EditText input, Button sendButton) {
-        String value = input.getText().toString();
-        if (value.isEmpty() || !sendButton.isEnabled()) return;
+    private void scheduleNext(int gen, Runnable tick) {
+        if (gen != viewGen) return;
+        refreshTick = tick;
+        ui.postDelayed(tick, 2000);
+    }
+
+    /** Sends the draft and Enter in one action. The draft stays editable while the
+     *  request is in flight and is cleared on success only if it was not edited. */
+    private void submitDraft(Host h, String sessionName, String blockId, EditText input, Button sendButton) {
+        final String snapshot = input.getText().toString();
+        if (snapshot.isEmpty() || !sendButton.isEnabled()) return;
         sendButton.setEnabled(false);
-        send(h, sessionName, blockId, "submit", value, ok -> {
+        send(h, sessionName, blockId, "submit", snapshot, ok -> {
             sendButton.setEnabled(true);
-            if (ok) input.setText("");
+            if (ok && input.getText().toString().equals(snapshot)) input.setText("");
         });
     }
 
@@ -583,43 +610,62 @@ public final class MainActivity extends Activity {
 
     private static final class HttpResult {
         final int code;
+        final String contentType;
         final String body;
-        HttpResult(int code, String body) { this.code = code; this.body = body; }
+        HttpResult(int code, String contentType, String body) {
+            this.code = code;
+            this.contentType = contentType;
+            this.body = body;
+        }
+
+        /** Older bridges answer /capture with text/plain; detect by content type. */
+        boolean isHtml() {
+            return contentType != null
+                    && contentType.toLowerCase(java.util.Locale.ROOT).contains("text/html");
+        }
     }
 
-    private static JSONObject body(String k, String v) {
-        try { return new JSONObject().put(k, v); } catch (Exception e) { return new JSONObject(); }
-    }
-
+    /** Logs only method, endpoint, status, duration and length — never bodies, names or addresses. */
     private static HttpResult http(Host h, String method, String path, JSONObject payload) throws Exception {
+        long started = SystemClock.elapsedRealtime();
         HttpURLConnection c = (HttpURLConnection) new URL(h.baseUrl() + path).openConnection();
-        c.setInstanceFollowRedirects(false); // Never send bridge or Access credentials to a redirect target.
-        c.setRequestMethod(method);
-        c.setConnectTimeout(4000);
-        c.setReadTimeout(15000);
-        c.setRequestProperty("Authorization", "Bearer " + h.token);
-        if (!h.accessId.isEmpty()) {
-            c.setRequestProperty("CF-Access-Client-Id", h.accessId);
-            c.setRequestProperty("CF-Access-Client-Secret", h.accessSecret);
-        }
-        if (payload != null) {
-            c.setDoOutput(true);
-            c.setRequestProperty("Content-Type", "application/json");
-            try (OutputStream os = c.getOutputStream()) {
-                os.write(payload.toString().getBytes(StandardCharsets.UTF_8));
+        try {
+            c.setInstanceFollowRedirects(false); // Never send bridge or Access credentials to a redirect target.
+            c.setRequestMethod(method);
+            c.setConnectTimeout(4000);
+            c.setReadTimeout(15000);
+            c.setRequestProperty("Authorization", "Bearer " + h.token);
+            if (!h.accessId.isEmpty()) {
+                c.setRequestProperty("CF-Access-Client-Id", h.accessId);
+                c.setRequestProperty("CF-Access-Client-Secret", h.accessSecret);
             }
-        }
-        int code = c.getResponseCode();
-        java.io.InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
-        StringBuilder sb = new StringBuilder();
-        if (in != null) {
-            try (BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
-                char[] buf = new char[2048];
-                int n;
-                while ((n = r.read(buf)) > 0 && sb.length() < 1_000_000) sb.append(buf, 0, n);
+            if (payload != null) {
+                c.setDoOutput(true);
+                c.setRequestProperty("Content-Type", "application/json");
+                try (OutputStream os = c.getOutputStream()) {
+                    os.write(payload.toString().getBytes(StandardCharsets.UTF_8));
+                }
             }
+            int code = c.getResponseCode();
+            String contentType = c.getContentType();
+            java.io.InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+            StringBuilder sb = new StringBuilder();
+            if (in != null) {
+                try (BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+                    char[] buf = new char[2048];
+                    int n;
+                    while ((n = r.read(buf)) > 0 && sb.length() < 1_000_000) sb.append(buf, 0, n);
+                }
+            }
+            Log.d(TAG, "http " + method + " " + path + " status=" + code
+                    + " ms=" + (SystemClock.elapsedRealtime() - started) + " len=" + sb.length());
+            return new HttpResult(code, contentType, sb.toString());
+        } catch (Exception e) {
+            Log.w(TAG, "http " + method + " " + path + " failed: " + e.getClass().getSimpleName());
+            throw e;
+        } finally {
+            c.disconnect();
         }
-        return new HttpResult(code, sb.toString());
     }
 
     // ---------- ui helpers ----------
@@ -627,11 +673,18 @@ public final class MainActivity extends Activity {
     private void stopTick() {
         viewGen++; // invalidate any in-flight capture for the previous view
         if (refreshTick != null) { ui.removeCallbacks(refreshTick); refreshTick = null; }
+        InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (imm != null) imm.hideSoftInputFromWindow(getWindow().getDecorView().getWindowToken(), 0);
     }
 
     private void runUi(Runnable r) { ui.post(r); }
 
-    private void status(String s) { if (status != null) status.setText(s); }
+    private void status(String s) {
+        if (status != null) {
+            status.setText(s);
+            status.setVisibility(s.isEmpty() ? View.GONE : View.VISIBLE);
+        }
+    }
 
     private ScrollView paddedScroll() {
         ScrollView scroll = new ScrollView(this);
@@ -832,10 +885,6 @@ public final class MainActivity extends Activity {
         return i >= 0 ? program.substring(i + 1) : program;
     }
 
-    private static String trimTail(String s, int max) {
-        return s.length() <= max ? s : s.substring(s.length() - max);
-    }
-
     private static int parseInt(String s, int fallback) {
         try { return Integer.parseInt(s.trim()); } catch (Exception e) { return fallback; }
     }
@@ -843,8 +892,6 @@ public final class MainActivity extends Activity {
     private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density + 0.5f); }
 
     private int dp1() { return dp(1); }
-
-    private int dp2() { return dp(2); }
 
     @Override protected void onDestroy() {
         super.onDestroy();

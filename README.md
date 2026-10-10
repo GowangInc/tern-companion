@@ -152,6 +152,12 @@ The Android checks run against the built APK with synthetic data. They do not re
 
 A release APK must retain the publisher’s signing identity. Local debug APKs use a different signer and cannot receive production-signed updates in place.
 
+## 1.4.1 changes
+
+Terminal redesign: the live screen is now a full-height terminal pane like the desktop — scrollback included, desktop colors preserved, wide lines kept as columns with touch scrolling (pinch to zoom). A pinned composer above the keyboard keeps standard Android text editing: Enter inserts a newline, **Send ▸** submits, and drafts survive failed sends. Scrolling up pauses tail-following without losing your place; **↓ Latest** jumps back. Key shortcuts moved to one horizontal strip (Ctrl+P, Ctrl+C, Esc, Tab, Enter, arrows). New sessions now start **OMP**, the same agent interface as the desktop.
+
+For diagnosis, the app logs to `adb logcat -s TernCompanion`: version, screen transitions, and per-request method/endpoint/status/duration/length — never tokens, payloads, or terminal contents. Update `tern_bridge.py` on each computer and restart it; new sessions require the updated bridge to launch OMP, and the rich terminal requests the bridge's HTML capture (older bridges still render as plain text).
+
 ## 1.4.0 changes
 
 In-app Back navigation: terminal → sessions → PC list, exit only from the PC list. Multiline composer that grows with your draft; Enter inserts a newline and Send submits it with Enter. New-session action on the sessions screen (uses the bridge's `/new`). Live screen now follows the active Tern surface (restart any bridge still running pre-1.3 code).
