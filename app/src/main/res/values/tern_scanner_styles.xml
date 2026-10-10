@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark platform theme so the ivory controls stay readable; the manifest
+         entry for PairingCaptureActivity references this theme. -->
+    <style name="TernPairingCaptureTheme" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/tern_ink</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@color/tern_ink</item>
+        <item name="android:navigationBarColor">@color/tern_ink</item>
+    </style>
+</resources>

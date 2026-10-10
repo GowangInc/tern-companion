@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/tern_ink"
+    android:fitsSystemWindows="true">
+
+    <com.journeyapps.barcodescanner.DecoratedBarcodeView
+        android:id="@+id/zxing_barcode_scanner"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        app:zxing_scanner_layout="@layout/tern_barcode_scanner"
+        app:zxing_preview_scaling_strategy="centerCrop"
+        app:zxing_use_texture_view="false"/>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingTop="8dp"
+        android:paddingEnd="8dp">
+
+        <Button
+            android:id="@+id/tern_cancel"
+            style="?android:attr/buttonBarButtonStyle"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:minWidth="48dp"
+            android:text="@string/tern_cancel"
+            android:textAllCaps="false"
+            android:textColor="@color/tern_ivory"/>
+
+        <Space
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1"/>
+
+        <ToggleButton
+            android:id="@+id/tern_torch"
+            style="?android:attr/buttonBarButtonStyle"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:minWidth="48dp"
+            android:textOn="@string/tern_light_on"
+            android:textOff="@string/tern_light_off"
+            android:textAllCaps="false"
+            android:textColor="@color/tern_ivory"
+            android:visibility="gone"/>
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/tern_instruction"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:layout_marginBottom="32dp"
+        android:gravity="center"
+        android:paddingStart="24dp"
+        android:paddingEnd="24dp"
+        android:text="@string/tern_scan_instruction"
+        android:textColor="@color/tern_ivory"
+        android:textSize="16sp"/>
+</FrameLayout>

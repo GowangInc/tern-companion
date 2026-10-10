@@ -1,0 +1,24 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'io.github.gowanginc.terncompanion'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'io.github.gowanginc.terncompanion'
+        minSdk 26
+        targetSdk 35
+        versionCode 5
+        versionName '1.4.0'
+    }
+    buildFeatures {
+        buildConfig true
+    }
+}
+
+dependencies {
+    implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
+    implementation 'androidx.core:core:1.6.0'
+}

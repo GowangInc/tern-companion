@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Preserves the prompt text previously passed via ScanOptions.setPrompt. -->
+    <string name="tern_scan_instruction">Scan the QR on your PC. Treat it like a password.</string>
+    <string name="tern_cancel">Cancel</string>
+    <string name="tern_light_on">Light on</string>
+    <string name="tern_light_off">Light off</string>
+</resources>

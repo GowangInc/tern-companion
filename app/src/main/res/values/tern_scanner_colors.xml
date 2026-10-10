@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Restrained linework palette for the pairing scanner: warm ink field,
+     ivory text, sage-green ink rules, one coral accent. -->
+<resources>
+    <color name="tern_ink">#1C1A17</color>
+    <color name="tern_ink_scrim">#9E1C1A17</color>
+    <color name="tern_ivory">#F2ECDC</color>
+    <color name="tern_green_ink">#2E5E4E</color>
+    <color name="tern_coral">#E4715A</color>
+</resources>
