@@ -364,7 +364,7 @@ public final class MainActivity extends Activity {
         root.removeAllViews();
 
         // Fixed chrome around an expanding terminal: no outer ScrollView, nothing
-        // that fights the pane's own vertical and horizontal touch scrolling.
+        // that fights the pane's own vertical scrolling.
         LinearLayout page = column();
         root.addView(page, new LinearLayout.LayoutParams(-1, -1));
 

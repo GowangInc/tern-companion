@@ -39,7 +39,8 @@ import java.util.regex.Pattern;
  * the view to the tail when the reader was already at the tail.
  */
 public final class TerminalView extends FrameLayout {
-    private static final String BG = "#140f18";
+    private static final String BG = "#f5f2e9";
+    private static final String INK = "#172622";
     private static final int TAIL_TOLERANCE_DP = 8;
     private static final long TAIL_SETTLE_MS = 80;
 
@@ -66,8 +67,11 @@ public final class TerminalView extends FrameLayout {
             + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0,"
             + " maximum-scale=10.0, user-scalable=yes\">"
             + "<style>html,body{margin:0;padding:0;background:" + BG + ";overflow:auto}"
-            + "pre{font-family:monospace;font-size:14px;line-height:1.35;white-space:pre;"
-            + "margin:0;padding:8px 10px;color:#f0e8f4;}</style></head><body>";
+            + "body{box-sizing:border-box;border-left:1px solid #d5dfd3;border-right:1px solid #d5dfd3;}"
+            + "pre{font-family:monospace;font-size:14px;line-height:1.45;white-space:pre-wrap;"
+            + "overflow-wrap:anywhere;margin:0;padding:10px 12px;color:" + INK + ";}"
+            + "#t{border-left:1px solid #b4c8b7;margin-left:5px;}"
+            + "::selection{background:#d5e2d5;color:" + INK + ";}</style></head><body>";
     private static final String SHELL_SCRIPT =
             "<script>function tSet(h){document.getElementById('t').innerHTML=h;}</script>";
 
@@ -92,7 +96,10 @@ public final class TerminalView extends FrameLayout {
         super(context, attrs);
         density = context.getResources().getDisplayMetrics().density;
         webView = new WebView(context);
-        addView(webView, new FrameLayout.LayoutParams(-1, -1));
+        FrameLayout.LayoutParams terminal = new FrameLayout.LayoutParams(-1, -1);
+        terminal.setMargins(dp(6), dp(4), dp(6), dp(4));
+        addView(webView, terminal);
+        setBackground(LineworkUi.cardBackground(context, Color.parseColor(BG), 0xffb4c8b7));
 
         jumpFab = new Button(context);
         jumpFab.setText("↓ Latest");
@@ -102,7 +109,7 @@ public final class TerminalView extends FrameLayout {
         jumpFab.setTypeface(Typeface.DEFAULT_BOLD);
         jumpFab.setMinHeight(dp(48));
         jumpFab.setPadding(dp(14), 0, dp(14), 0);
-        jumpFab.setBackgroundColor(0xff17634e);
+        jumpFab.setBackground(LineworkUi.cardBackground(context, 0xff17634e, 0xff172622));
         jumpFab.setVisibility(GONE);
         jumpFab.setContentDescription("Jump to the latest terminal output");
         jumpFab.setOnClickListener(v -> scrollToTail());
@@ -120,7 +127,7 @@ public final class TerminalView extends FrameLayout {
         ws.setSupportZoom(true);
         ws.setBuiltInZoomControls(true);
         ws.setDisplayZoomControls(false);
-        ws.setUseWideViewPort(false); // natural column width; horizontal touch scroll.
+        ws.setUseWideViewPort(false); // keep the phone width as the line-wrapping width.
         ws.setLoadWithOverviewMode(false);
         if (Build.VERSION.SDK_INT >= 26) ws.setSafeBrowsingEnabled(true);
 
@@ -185,8 +192,8 @@ public final class TerminalView extends FrameLayout {
         if (tail) webView.postDelayed(this::scrollToTail, TAIL_SETTLE_MS);
     }
 
-    /** True when the reader is at the bottom edge of the capture. Horizontal
-     *  position does not affect which rows are visible (nowrap pre layout). */
+    /** True when the reader is at the bottom edge of the capture. Lines wrap
+     *  to the pane width, so horizontal position does not affect visible rows. */
     public boolean isAtTail() {
         int contentH = Math.round(webView.getContentHeight() * webView.getScale());
         if (contentH <= 0) return true; // nothing laid out yet; never flash the FAB during load.
@@ -203,18 +210,15 @@ public final class TerminalView extends FrameLayout {
 
     private final Runnable tailCheck = new Runnable() {
         @Override public void run() {
-            android.util.Log.d("TernCompanion", "tailcheck sy=" + webView.getScrollY()
-                    + " ch=" + webView.getContentHeight() + " h=" + webView.getHeight()
-                    + " at=" + isAtTail());
             if (tailListener != null) tailListener.onTailChange(isAtTail());
         }
     };
 
-    /** Jumps to the bottom-right tail of the capture. */
+    /** Jumps to the bottom edge of the capture. */
     public void scrollToTail() {
         // Large but finite: Integer.MAX_VALUE is stored unclamped by WebView and
         // overflows position arithmetic (MAX + height goes negative).
-        webView.scrollTo(1 << 22, 1 << 22);
+        webView.scrollTo(0, 1 << 22);
         scheduleTailCheck();
     }
 
@@ -266,10 +270,37 @@ public final class TerminalView extends FrameLayout {
             String low = val.toLowerCase(Locale.ROOT);
             if (!SAFE_VALUE_RE.matcher(val).matches()
                     || low.contains("url") || low.contains("expression") || low.contains("javascript")) continue;
+            if ("color".equals(prop) || "background-color".equals(prop)) {
+                val = paperColor(val, "background-color".equals(prop));
+            }
             if (out.length() > 0) out.append(';');
             out.append(prop).append(':').append(val);
         }
         return out.toString();
+    }
+
+    /** Translate terminal colors into readable spot inks and pale highlight fields. */
+    private static String paperColor(String value, boolean background) {
+        final int color;
+        try {
+            color = Color.parseColor(value);
+        } catch (IllegalArgumentException unsupported) {
+            return background ? BG : INK;
+        }
+        int r = Color.red(color), g = Color.green(color), b = Color.blue(color);
+        int max = Math.max(r, Math.max(g, b)), min = Math.min(r, Math.min(g, b));
+        if (max - min < 32) {
+            return background ? BG : (max >= 90 && max < 210 ? "#5d6b64" : INK);
+        }
+        if (r >= b && g * 4 >= r * 3 && b * 4 < g * 3) {
+            return background ? "#eee5cf" : "#806022";
+        }
+        if (r >= g && r >= b) {
+            if (b * 4 >= r * 3) return background ? "#eae2ec" : "#694e76";
+            return background ? "#f3e0d9" : "#a33f32";
+        }
+        if (g >= b) return background ? "#e2ebdf" : "#17634e";
+        return background ? "#e0e8ed" : "#365e7a";
     }
 
     private static String escape(String s) {

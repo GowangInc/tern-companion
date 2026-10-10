@@ -152,6 +152,10 @@ The Android checks run against the built APK with synthetic data. They do not re
 
 A release APK must retain the publisher’s signing identity. Local debug APKs use a different signer and cannot receive production-signed updates in place.
 
+## 1.4.2 changes
+
+The terminal uses a warm paper-and-ink linework theme with fine registration arcs and a ruled reading margin. Desktop colors become contrast-checked sage, coral, blue, violet and ochre inks with pale highlight fields rather than white text on a dark surface. Long lines wrap to the phone width; explicit line breaks, emphasis and full scrollback remain intact. Scrolling up preserves your reading position during refresh, **↓ Latest** restores tail-following, and the multiline composer stays above the keyboard.
+
 ## 1.4.1 changes
 
 Terminal redesign: the live screen is now a full-height terminal pane like the desktop — scrollback included, desktop colors preserved, wide lines kept as columns with touch scrolling (pinch to zoom). A pinned composer above the keyboard keeps standard Android text editing: Enter inserts a newline, **Send ▸** submits, and drafts survive failed sends. Scrolling up pauses tail-following without losing your place; **↓ Latest** jumps back. Key shortcuts moved to one horizontal strip (Ctrl+P, Ctrl+C, Esc, Tab, Enter, arrows). New sessions now start **OMP**, the same agent interface as the desktop.

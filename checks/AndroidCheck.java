@@ -2,6 +2,7 @@ package io.github.gowanginc.terncompanion;
 
 import android.app.Activity;
 import android.content.Context;
+import android.graphics.Color;
 import android.content.pm.PackageManager;
 import android.content.pm.Signature;
 import android.os.Looper;
@@ -27,6 +28,7 @@ public final class AndroidCheck {
         expect(signers, null, new Signature[] {a}, false);
         expect(signers, new Signature[] {null}, new Signature[] {a}, false);
         System.out.println("Android current-signer compatibility checks passed.");
+        checkTerminalTheme();
         if (args.length == 0) {
             System.out.println("Platform APK archive guards NOT RUN; supply newer, wrong-signer and wrong-package APK paths.");
             return;
@@ -61,6 +63,35 @@ public final class AndroidCheck {
             if (!expected.getCause().getMessage().contains("incomplete")) throw expected;
         }
         System.out.println("Platform APK package, signer, version and size guards passed.");
+    }
+
+    private static void checkTerminalTheme() throws Exception {
+        Method sanitize = TerminalView.class.getDeclaredMethod("sanitize", String.class);
+        sanitize.setAccessible(true);
+        String[] colors = {"#f0e8f4", "#140f18", "#9fb4bd", "#8eb897",
+                "#d96c75", "#7c9cf0", "#ffff00", "#ff00ff", "white", "rgb(255,255,255)"};
+        for (String source : colors) {
+            String html = (String) sanitize.invoke(null, "<span style=\"color:" + source
+                    + ";background-color:" + source + "\">readable</span>");
+            java.util.regex.Matcher colorsOut = java.util.regex.Pattern.compile(
+                    "(?:^|[\";])(?:color|background-color):(#[0-9a-f]{6})").matcher(html);
+            if (!colorsOut.find()) throw new AssertionError("Terminal text color missing");
+            int ink = Color.parseColor(colorsOut.group(1));
+            if (!colorsOut.find()) throw new AssertionError("Terminal highlight missing");
+            int paper = Color.parseColor(colorsOut.group(1));
+            double paperLuminance = Color.luminance(paper);
+            double inkLuminance = Color.luminance(ink);
+            if (paperLuminance < 0.75
+                    || (paperLuminance + 0.05) / (inkLuminance + 0.05) < 4.5
+                    || (Color.luminance(Color.parseColor("#f5f2e9")) + 0.05)
+                            / (inkLuminance + 0.05) < 4.5) {
+                throw new AssertionError("Unreadable paper terminal color: " + source);
+            }
+        }
+        String red = (String) sanitize.invoke(null, "<span style=\"color:red\">status</span>");
+        String green = (String) sanitize.invoke(null, "<span style=\"color:green\">status</span>");
+        if (red.equals(green)) throw new AssertionError("Terminal status colors collapsed");
+        System.out.println("Paper terminal text/highlight contrast checks passed.");
     }
 
     private static void expect(Method method, Signature[] a, Signature[] b, boolean expected) throws Exception {
