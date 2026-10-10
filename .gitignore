@@ -12,6 +12,7 @@
 !/app/
 !/checks/
 !/tern_bridge.py
+!/conversation.py
 !/tern_qr.py
 !/requirements-qr.txt
 !/gradle/wrapper/

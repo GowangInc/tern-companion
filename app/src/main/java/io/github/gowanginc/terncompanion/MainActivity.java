@@ -466,6 +466,25 @@ public final class MainActivity extends Activity {
         headerRule.setBackgroundColor(0xffb4c8b7);
         page.addView(headerRule, new LinearLayout.LayoutParams(-1, dp1()));
 
+        final int[] pageEnd = {-1}; // -1 follows the latest page; otherwise a history boundary.
+        final int[] pageStart = {0};
+        final boolean[] changingPage = {false};
+        LinearLayout historyBar = row();
+        historyBar.setPadding(dp(12), 0, dp(12), 0);
+        historyBar.setVisibility(View.GONE);
+        Button earlierButton = smallButton("Earlier");
+        earlierButton.setTextSize(14);
+        earlierButton.setContentDescription("Load earlier messages");
+        historyBar.addView(earlierButton, new LinearLayout.LayoutParams(dp(72), dp(48)));
+        TextView pageRange = text("", 12, MUTED, Typeface.DEFAULT);
+        pageRange.setGravity(Gravity.CENTER);
+        historyBar.addView(pageRange, weight1());
+        Button latestButton = smallButton("Latest");
+        latestButton.setTextSize(14);
+        latestButton.setContentDescription("Load latest messages");
+        historyBar.addView(latestButton, new LinearLayout.LayoutParams(dp(72), dp(48)));
+        page.addView(historyBar, new LinearLayout.LayoutParams(-1, dp(48)));
+
         // 2. Terminal pane: takes all remaining height, IME on or off.
         final TerminalView pane = new TerminalView(this);
         pane.setTextSizeSp(terminalTextSize());
@@ -479,13 +498,17 @@ public final class MainActivity extends Activity {
         header.addView(settingsBtn, new LinearLayout.LayoutParams(dp(48), dp(48)));
         page.addView(pane, new LinearLayout.LayoutParams(-1, 0, 1));
 
-        // One shared error/status line, hidden unless something is wrong.
+        // Capture refreshes must not erase an unconfirmed-send error.
         final TextView captureNote = text("", 12, CORAL, Typeface.MONOSPACE);
         captureNote.setContentDescription("Live screen status");
         captureNote.setVisibility(View.GONE);
         captureNote.setPadding(dp(12), dp(4), dp(12), dp(4));
         page.addView(captureNote, new LinearLayout.LayoutParams(-1, -2));
-        status = captureNote;
+        status = text("", 12, CORAL, Typeface.MONOSPACE);
+        status.setContentDescription("Send status");
+        status.setVisibility(View.GONE);
+        status.setPadding(dp(12), dp(4), dp(12), dp(4));
+        page.addView(status, new LinearLayout.LayoutParams(-1, -2));
 
         // 3. Shortcut strip: one horizontally scrollable row of terminal keys.
         String[][] keys = {
@@ -548,7 +571,7 @@ public final class MainActivity extends Activity {
         sendButton.setTextColor(PAPER);
         sendButton.setBackground(new RippleDrawable(ColorStateList.valueOf(0x44ffffff),
                 bg(GREEN, GREEN), null));
-        sendButton.setContentDescription("Send the text and press Enter in the terminal");
+        sendButton.setContentDescription("Send message");
         LinearLayout.LayoutParams sendLp = new LinearLayout.LayoutParams(-2, dp(48));
         sendLp.leftMargin = dp(8);
         composer.addView(sendButton, sendLp);
@@ -561,32 +584,82 @@ public final class MainActivity extends Activity {
         // scheduled after the current request completes (no 2s backlog).
         final Runnable tick = new Runnable() {
             @Override public void run() {
+                final int requestedEnd = pageEnd[0];
                 io.execute(() -> {
                     try {
                         JSONObject req = new JSONObject()
-                                .put("block", sessionName + "/" + blockId).put("format", "html");
+                                .put("block", sessionName + "/" + blockId).put("format", "conversation");
+                        if (requestedEnd >= 0) req.put("before", requestedEnd);
                         HttpResult r = http(h, "POST", "/capture", req);
+                        final JSONObject capture = r.code == 200 ? new JSONObject(r.body) : null;
+                        final String captureType = capture == null ? "" : capture.getString("type");
+                        if (capture != null && !"conversation".equals(captureType)
+                                && !"terminal".equals(captureType)) {
+                            throw new Exception("Unsupported screen response");
+                        }
                         runUi(() -> {
-                            if (gen != viewGen) return;
+                            if (gen != viewGen || requestedEnd != pageEnd[0]) return;
                             if (r.code == 200) {
-                                captureNote.setText("");
-                                if (r.isHtml()) pane.loadCapture(r.body);
-                                else pane.loadPlainText(r.body);
+                                status(captureNote, "");
+                                if ("conversation".equals(captureType)) {
+                                    pane.loadConversation(capture);
+                                    pageStart[0] = capture.optInt("start");
+                                    int end = capture.optInt("end");
+                                    int total = capture.optInt("total");
+                                    historyBar.setVisibility(pageStart[0] > 0 || requestedEnd >= 0
+                                            ? View.VISIBLE : View.GONE);
+                                    earlierButton.setEnabled(pageStart[0] > 0);
+                                    latestButton.setEnabled(requestedEnd >= 0);
+                                    pageRange.setText((pageStart[0] + 1) + "–" + end + " / " + total);
+                                    if (changingPage[0]) {
+                                        changingPage[0] = false;
+                                        pane.postDelayed(pane::scrollToTail, 100);
+                                    }
+                                } else {
+                                    pane.loadCapture(capture.optString("html"));
+                                }
+                                live.setText(requestedEnd >= 0 ? "History" : "Live");
                             } else {
-                                captureNote.setText("Not live: HTTP " + r.code);
+                                status(captureNote, "Not live: " + r.body);
+                                earlierButton.setEnabled(pageStart[0] > 0);
+                                latestButton.setEnabled(requestedEnd >= 0);
+                                live.setText("Offline");
                             }
                             scheduleNext(gen, this);
                         });
                     } catch (Exception e) {
                         runUi(() -> {
-                            if (gen != viewGen) return;
-                            captureNote.setText("Screen unavailable: " + shortError(e));
+                            if (gen != viewGen || requestedEnd != pageEnd[0]) return;
+                            status(captureNote, "Screen unavailable: " + shortError(e));
+                            earlierButton.setEnabled(pageStart[0] > 0);
+                            latestButton.setEnabled(requestedEnd >= 0);
+                            live.setText("Offline");
                             scheduleNext(gen, this);
                         });
                     }
                 });
             }
         };
+        earlierButton.setOnClickListener(v -> {
+            pageEnd[0] = pageStart[0];
+            changingPage[0] = true;
+            earlierButton.setEnabled(false);
+            latestButton.setEnabled(false);
+            if (refreshTick != null) ui.removeCallbacks(refreshTick);
+            tick.run();
+        });
+        latestButton.setOnClickListener(v -> {
+            pageEnd[0] = -1;
+            changingPage[0] = true;
+            earlierButton.setEnabled(false);
+            latestButton.setEnabled(false);
+            if (refreshTick != null) ui.removeCallbacks(refreshTick);
+            tick.run();
+        });
+        pane.setOnJumpToLatestListener(() -> {
+            if (pageEnd[0] >= 0) latestButton.performClick();
+            else pane.scrollToTail();
+        });
         tick.run();
     }
 
@@ -619,7 +692,10 @@ public final class MainActivity extends Activity {
                         .put("kind", kind).put("value", value);
                 HttpResult r = http(h, "POST", "/send", b);
                 if (r.code != 200) throw new Exception(r.body);
-                if (result != null) runUi(() -> result.done(true));
+                runUi(() -> {
+                    status("");
+                    if (result != null) result.done(true);
+                });
             } catch (Exception e) {
                 runUi(() -> {
                     status("Send failed: " + shortError(e));
@@ -786,9 +862,13 @@ public final class MainActivity extends Activity {
     private void runUi(Runnable r) { ui.post(r); }
 
     private void status(String s) {
-        if (status != null) {
-            status.setText(s);
-            status.setVisibility(s.isEmpty() ? View.GONE : View.VISIBLE);
+        status(status, s);
+    }
+
+    private void status(TextView target, String s) {
+        if (target != null) {
+            target.setText(s);
+            target.setVisibility(s.isEmpty() ? View.GONE : View.VISIBLE);
         }
     }
 

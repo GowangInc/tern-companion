@@ -26,7 +26,7 @@ The public app ID is `io.github.gowanginc.terncompanion`. Earlier local builds u
 
 ## 1. Start the bridge on the computer
 
-Download this repository to each computer you want to control. Run the bridge from its directory.
+Download this repository to each computer you want to control. Run the bridge from its directory, keeping `conversation.py` beside `tern_bridge.py`. On macOS, transcript discovery uses the system `/usr/sbin/lsof`; Linux uses `/proc`.
 
 ### Private Tailscale access
 
@@ -131,8 +131,8 @@ The updater rejects an unexpected package, different signing certificate, older 
 - **Cannot connect:** verify the bridge is running, the address is reachable and the separate port is correct.
 - **HTTP 401:** generate a new QR from the current bridge token and pair again.
 - **No sessions:** run `tern ls --json` on the computer. The bridge must run as the user who owns those sessions.
-- **Old bridge rejects Send:** update `tern_bridge.py` and restart that bridge. Send now uses `kind=submit`.
-- **Screen differs from desktop:** update the bridge. Active plugin text requires Tern’s `capture --surfaces` support.
+- **Send not confirmed:** update both `tern_bridge.py` and `conversation.py`, then restart the bridge. OMP sends use one bracketed paste plus a literal carriage return, and success requires a newly persisted user message. If acceptance times out, the draft stays on the phone; check the desktop before retrying.
+- **Screen differs from desktop:** update both bridge files. OMP conversations come from the foreground process’s exact session transcript; other terminal blocks use Tern’s `capture --surfaces` support.
 - **Model does not cycle:** Ctrl+P reaches the terminal. Its meaning depends on the terminal program’s key bindings.
 - **Camera unavailable:** use **Load QR image**. Camera behavior still needs checking on each physical phone model.
 - **Update certificate mismatch:** use the official release. Do not uninstall the app to bypass the check.
@@ -166,6 +166,15 @@ This exercises the native slider, preview, persistence and reset, restores the o
 
 A release APK must retain the publisher’s signing identity. Local debug APKs use a different signer and cannot receive production-signed updates in place.
 
+## 1.4.5 changes
+
+OMP conversations now display separate user and assistant messages with Markdown headings, lists, emphasis and code blocks. Tool output and injected context are collapsed, not deleted; hidden/system messages and thinking are not displayed. Raw HTML cannot run scripts or load remote resources.
+
+Long conversations use **Earlier** and **Latest** pages rather than dropping older messages. Pages preserve whole messages; the 1MiB capture ceiling remains. The bridge’s `POST /capture` with `format: "conversation"` returns `messages`, `start`, `end` and `total`; optional `before` selects the preceding page. Terminal controls, font settings, scrollback and keyboard-aware shortcuts remain available.
+
+**Send** preserves multiline prompts atomically and confirms OMP acceptance before clearing the draft. Capture refreshes no longer erase failed-send errors. Update both bridge files on every computer and restart the bridge; the 1.4.5 phone client requires this updated capture contract. A real Android Send, persisted prompt, formatted OMP reply, history navigation and native boundary checks were verified on Android 15.
+
+
 ## 1.4.4 changes
 
 Added saved terminal text-size settings with a native accessible slider, live preview and reset. Open them from the PC list or the terminal’s **Aa** button. Text resizing preserves the capture, history and tail-follow intent; keyboard-aware shortcuts and the native composer are unchanged.
@@ -184,7 +193,7 @@ The terminal uses a warm paper-and-ink linework theme with fine registration arc
 
 Terminal redesign: the live screen is now a full-height terminal pane like the desktop — scrollback included, desktop colors preserved, wide lines kept as columns with touch scrolling (pinch to zoom). A pinned composer above the keyboard keeps standard Android text editing: Enter inserts a newline, **Send ▸** submits, and drafts survive failed sends. Scrolling up pauses tail-following without losing your place; **↓ Latest** jumps back. Key shortcuts moved to one horizontal strip (Ctrl+P, Ctrl+C, Esc, Tab, Enter, arrows). New sessions now start **OMP**, the same agent interface as the desktop.
 
-For diagnosis, the app logs to `adb logcat -s TernCompanion`: version, screen transitions, and per-request method/endpoint/status/duration/length — never tokens, payloads, or terminal contents. Update `tern_bridge.py` on each computer and restart it; new sessions require the updated bridge to launch OMP, and the rich terminal requests the bridge's HTML capture (older bridges still render as plain text).
+For diagnosis, the app logs to `adb logcat -s TernCompanion`: version, screen transitions, and per-request method/endpoint/status/duration/length — never tokens, payloads, or terminal contents.
 
 ## 1.4.0 changes
 

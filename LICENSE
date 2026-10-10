@@ -21,5 +21,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 This license covers the original companion and bridge code. Tern itself is a
-separate product owned by Stencil. Android, ZXing and AndroidX retain their
+separate product owned by Stencil. Android, ZXing, AndroidX and CommonMark retain their
 respective licenses and trademarks. This project is not an official Stencil app.
+
+The CommonMark Java BSD-2-Clause notice is in
+app/src/main/assets/commonmark-LICENSE.txt and is bundled in the APK.

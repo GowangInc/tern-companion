@@ -10,6 +10,8 @@ import java.io.File;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 /** Real Android certificate objects and optional platform APK archive checks. */
 public final class AndroidCheck {
@@ -29,6 +31,7 @@ public final class AndroidCheck {
         expect(signers, new Signature[] {null}, new Signature[] {a}, false);
         System.out.println("Android current-signer compatibility checks passed.");
         checkTerminalTheme();
+        checkTerminalConversation();
         if (args.length == 0) {
             System.out.println("Platform APK archive guards NOT RUN; supply newer, wrong-signer and wrong-package APK paths.");
             return;
@@ -92,6 +95,48 @@ public final class AndroidCheck {
         String green = (String) sanitize.invoke(null, "<span style=\"color:green\">status</span>");
         if (red.equals(green)) throw new AssertionError("Terminal status colors collapsed");
         System.out.println("Paper terminal text/highlight contrast checks passed.");
+    }
+
+    /** Conversation captures: escaping, markdown rendering, fixed role classes. */
+    private static void checkTerminalConversation() throws Exception {
+        Method render = TerminalView.class.getDeclaredMethod("conversationHtml", JSONObject.class);
+        render.setAccessible(true);
+        JSONArray messages = new JSONArray();
+        messages.put(new JSONObject().put("role", "user").put("format", "markdown")
+                .put("text", "# Heading\n\n<body onload=x>raw</body>\n<files>a/b.txt</files>\n\n"
+                        + "```java\nint a = 1;\n```\n"));
+        messages.put(new JSONObject().put("role", "assistant").put("format", "markdown")
+                .put("text", "Use **bold**, `code`, [bad](javascript:alert(1)) and "
+                        + "[ok](https://example.com/x)\n\n![diagram](https://example.com/p.png)\n"));
+        messages.put(new JSONObject().put("role", "tool").put("name", "read <x>").put("format", "text")
+                .put("id", "x\" onclick=\"alert(1)").put("text", "line one\nline two <b>bold</b>"));
+        messages.put(new JSONObject().put("role", "weird<script>").put("format", "text")
+                .put("text", "unknown role body"));
+        String html = (String) render.invoke(null, new JSONObject().put("messages", messages));
+
+        for (String forbidden : new String[] {"<script", "<body", "<files>", "javascript:", "onload=x>", "\" onclick="}) {
+            if (html.contains(forbidden)) throw new AssertionError("Conversation markup leaked " + forbidden);
+        }
+        for (String required : new String[] {"&lt;body onload=x&gt;", "&lt;files&gt;a/b.txt&lt;/files&gt;",
+                "<h1", "<strong>bold</strong>", "<code>code</code>", "int a = 1;",
+                "href=\"https://example.com/x\"", "alt=\"diagram\"",
+                "line two &lt;b&gt;bold&lt;/b&gt;", "weird&lt;script&gt;"}) {
+            if (!html.contains(required)) throw new AssertionError("Conversation markup missing " + required);
+        }
+        if (html.contains("<details open")) throw new AssertionError("Tool card not collapsed");
+        if (html.contains("# Heading")) throw new AssertionError("Markdown left as source text");
+        java.util.Set<String> allowed = new java.util.HashSet<>(java.util.Arrays.asList(
+                "msg", "user", "assistant", "tool", "context", "other", "who", "name", "body", "plain"));
+        java.util.regex.Matcher classes =
+                java.util.regex.Pattern.compile("class=\"([^\"]*)\"").matcher(html);
+        while (classes.find()) {
+            for (String token : classes.group(1).split("\\s+")) {
+                if (token.isEmpty() || allowed.contains(token)
+                        || token.matches("language-[A-Za-z0-9+#._-]+")) continue;
+                throw new AssertionError("Payload text reached a class attribute: " + token);
+            }
+        }
+        System.out.println("Conversation card escaping, markdown and role-class checks passed.");
     }
 
     private static void expect(Method method, Signature[] a, Signature[] b, boolean expected) throws Exception {

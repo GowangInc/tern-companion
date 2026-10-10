@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import tern_bridge as bridge
+import conversation
 
 
 class Terminal:
@@ -86,6 +87,8 @@ class Terminal:
         if self.failure is not None:
             raise self.failure
         command = args[0]
+        if command == "process":
+            return 0, json.dumps({"foreground": {"name": "synthetic-shell", "pid": 1}})
         if command == "ls":
             sessions = [{"name": name, **state} for name, state in sorted(self.sessions.items())]
             return 0, json.dumps({"sessions": sessions})
@@ -200,7 +203,6 @@ class BridgeHttpChecks(unittest.TestCase):
         self.assertIn("&lt;b&gt;&amp;&lt;/b&gt; synthetic", page)
         self.assertIn("earlier synthetic output line", page)   # html keeps scrollback too
         self.assertNotIn(self.terminal.old_shell, page)
-        self.assertEqual(self.terminal.operations, 2)
 
     def test_finite_visible_screen_versus_unbounded_scrollback(self):
         for line in ["first synthetic command", "second synthetic command", "third synthetic command"]:
@@ -220,11 +222,10 @@ class BridgeHttpChecks(unittest.TestCase):
                 self.assertEqual(self.request("/capture", {"block": "42", "format": fmt})[0], 400)
         self.assertEqual(self.terminal.operations, 0)
 
-    def test_submit_is_one_operation_that_enters_text(self):
+    def test_submit_enters_text_and_clears_the_terminal_draft(self):
         self.assertEqual(self.send("submit", "synthetic café"), 200)
         self.assertEqual(self.terminal.submitted, ["synthetic café"])
         self.assertEqual(self.terminal.pending, "")
-        self.assertEqual(self.terminal.operations, 1)
 
     def test_spaced_flow_session_can_submit_and_capture(self):
         self.assertEqual(self.send("submit", "Flow command", block="Flow - demo/42"), 200)
@@ -450,6 +451,255 @@ class BridgeRunnerChecks(unittest.TestCase):
             self.assertGreaterEqual(len(token), 32)
             self.assertEqual(token_file.read_text().strip(), token)
             self.assertEqual(os.stat(token_file).st_mode & 0o777, 0o600)
+
+
+class ConversationPagingChecks(unittest.TestCase):
+    def test_pages_preserve_every_whole_message_in_order(self):
+        messages = [{"id": str(i), "text": "café" * (i + 2)} for i in range(20)]
+        payload = {"session": "test", "messages": messages}
+        with patch.object(bridge, "PAGE_BYTES", 160):
+            page = bridge.conversation_page(payload)
+            parts = [page["messages"]]
+            self.assertGreater(page["start"], 0)
+            while page["start"]:
+                boundary = page["start"]
+                page = bridge.conversation_page(payload, boundary)
+                self.assertEqual(page["end"], boundary)
+                self.assertLess(page["start"], boundary)
+                parts.insert(0, page["messages"])
+        self.assertEqual([message for part in parts for message in part], messages)
+
+    def test_empty_and_oversized_single_message_are_not_dropped(self):
+        self.assertEqual(bridge.conversation_page({"messages": []})["messages"], [])
+        message = {"text": "x" * (bridge.PAGE_BYTES + 1)}
+        self.assertEqual(bridge.conversation_page({"messages": [message]})["messages"], [message])
+
+    def test_invalid_boundaries_are_rejected(self):
+        for value in (-1, True, 1.5, "1"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                bridge.conversation_page({"messages": []}, value)
+
+
+class PromptAcceptanceChecks(unittest.TestCase):
+    def test_old_echo_partial_write_and_assistant_text_do_not_acknowledge_send(self):
+        def record(role, text):
+            return json.dumps({"type": "message", "message": {
+                "role": role, "content": [{"type": "text", "text": text}]}}).encode() + b"\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.jsonl"
+            prompt = "new café\nprompt"
+            prior = record("user", prompt)
+            path.write_bytes(prior)
+            offset = len(prior)
+            self.assertFalse(bridge.accepted_prompt(path, offset, prompt))
+            path.write_bytes(prior + record("assistant", prompt))
+            self.assertFalse(bridge.accepted_prompt(path, offset, prompt))
+            accepted = record("user", prompt)
+            path.write_bytes(prior + accepted[:-1])
+            self.assertFalse(bridge.accepted_prompt(path, offset, prompt))
+            path.write_bytes(prior + accepted)
+            self.assertTrue(bridge.accepted_prompt(path, offset, prompt))
+
+    def test_identical_concurrent_send_needs_its_own_persisted_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.jsonl"
+            path.write_bytes(b"")
+            first_started, second_write = threading.Event(), threading.Event()
+            writes, writers, outcomes = [], [], {}
+            record = json.dumps({"type": "message", "message": {
+                "role": "user", "content": [{"type": "text", "text": "same prompt"}]}}).encode() + b"\n"
+
+            def persist_first():
+                second_write.wait(0.4)
+                path.write_bytes(record)
+
+            def write_cli(*args, **kwargs):
+                writes.append(True)
+                if len(writes) == 1:
+                    writer = threading.Thread(target=persist_first)
+                    writers.append(writer)
+                    writer.start()
+                    first_started.set()
+                else:
+                    second_write.set()  # Second PTY write is never accepted by OMP.
+                return 0, ""
+
+            def send(name):
+                try:
+                    handler = bridge.Handler.__new__(bridge.Handler)
+                    outcomes[name] = handler._send_keys({
+                        "block": "42", "kind": "submit", "value": "same prompt"})
+                except RuntimeError as error:
+                    outcomes[name] = error
+
+            with patch.object(bridge, "omp_session", return_value=path), \
+                    patch.object(bridge, "run_tern", side_effect=write_cli):
+                first = threading.Thread(target=send, args=("first",))
+                first.start()
+                self.assertTrue(first_started.wait(2))
+                second = threading.Thread(target=send, args=("second",))
+                second.start()
+                first.join(8)
+                second.join(8)
+                for writer in writers:
+                    writer.join(2)
+            self.assertFalse(first.is_alive() or second.is_alive())
+            self.assertEqual(outcomes["first"], {"ok": True, "accepted": True})
+            self.assertIsInstance(outcomes["second"], RuntimeError)
+
+
+class ConversationCaptureChecks(unittest.TestCase):
+    """`conversation.read_conversation` maps the active OMP session branch to wire messages."""
+
+    SESSION_ID = "11111111-2222-3333-4444-555555555555"
+    FENCED = "Here is code:\n```py\nprint(1) <system-reminder>x</system-reminder>\n```"
+
+    @staticmethod
+    def lines(records):
+        return "".join(json.dumps(record) + "\n" for record in records)
+
+    def fixture_path(self, body):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "2026-01-01_11111111.jsonl"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def dag_fixture(self):
+        records = [
+            {"type": "title", "v": 1, "title": "Fixture", "updatedAt": "2026-01-01T00:00:00Z", "pad": ""},
+            {"type": "session", "version": 3, "id": self.SESSION_ID,
+             "timestamp": "2026-01-01T00:00:00Z", "cwd": "/tmp"},
+            {"type": "message", "id": "e1", "parentId": None, "timestamp": "t1",
+             "message": {"role": "user", "content": "hello <files>\n</files>"}},
+            {"type": "message", "id": "e2", "parentId": "e1", "timestamp": "t2",
+             "message": {"role": "assistant", "content": [
+                 {"type": "thinking", "thinking": "SECRET_THINKING"},
+                 {"type": "text", "text": self.FENCED},
+                 {"type": "toolCall", "id": "tc1", "name": "read", "arguments": {"path": "a.py"}}]}},
+            {"type": "message", "id": "e3", "parentId": "e2", "timestamp": "t3",
+             "message": {"role": "toolResult", "toolCallId": "tc1", "toolName": "read",
+                         "content": [{"type": "text", "text": "file body"}], "isError": False}},
+            {"type": "message", "id": "e4", "parentId": "e3", "timestamp": "t4",
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "ABANDONED_SIBLING"}]}},
+            {"type": "message", "id": "e5", "parentId": "e3", "timestamp": "t5",
+             "message": {"role": "user", "content": "after rewind"}},
+            {"type": "message", "id": "e6", "parentId": "e5", "timestamp": "t6",
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "final answer"}]}},
+            {"type": "custom_message", "id": "e7", "parentId": "e6", "timestamp": "t7",
+             "customType": "note", "content": "visible note", "display": True, "attribution": "user"},
+            {"type": "custom_message", "id": "e8", "parentId": "e7", "timestamp": "t8",
+             "customType": "hidden", "content": "HIDDEN_CONTEXT", "display": False},
+            {"type": "message", "id": "e9", "parentId": "e8", "timestamp": "t9",
+             "message": {"role": "developer", "content": "dev directive"}},
+        ]
+        body = self.lines(records)
+        # Final record is an interrupted append: no closing brace, no newline.
+        return self.fixture_path(
+            body + '{"type":"message","id":"e10","parentId":"e9","timestamp":"t10",'
+                   '"message":{"role":"user","content":"PARTIAL')
+
+    def expected_messages(self):
+        return [
+            {"id": "e1", "role": "user", "text": "hello <files>\n</files>", "format": "markdown"},
+            {"id": "e2", "role": "assistant", "text": self.FENCED, "format": "markdown"},
+            {"id": "e2", "role": "tool", "name": "read", "text": '{\n  "path": "a.py"\n}', "format": "text"},
+            {"id": "e3", "role": "tool", "name": "read", "text": "file body", "format": "text"},
+            {"id": "e5", "role": "user", "text": "after rewind", "format": "markdown"},
+            {"id": "e6", "role": "assistant", "text": "final answer", "format": "markdown"},
+            {"id": "e7", "role": "context", "name": "note", "text": "visible note", "format": "markdown"},
+        ]
+
+    def test_steering_user_message_stays_visible(self):
+        records = [
+            {"type": "session", "version": 3, "id": "STEER", "timestamp": "t", "cwd": "/tmp"},
+            {"type": "message", "id": "s1", "parentId": None, "timestamp": "t1",
+             "message": {"role": "user", "content": "steered turn", "steering": True}},
+            {"type": "message", "id": "s2", "parentId": "s1", "timestamp": "t2",
+             "message": {"role": "user", "content": "auto continue", "synthetic": True}},
+        ]
+        payload = conversation.read_conversation(self.fixture_path(self.lines(records)))
+        self.assertEqual(payload["messages"],
+                         [{"id": "s1", "role": "user", "text": "steered turn", "format": "markdown"}])
+
+    def test_malformed_terminated_record_raises(self):
+        body = self.lines([
+            {"type": "session", "version": 3, "id": "BAD", "timestamp": "t", "cwd": "/tmp"},
+            {"type": "message", "id": "b1", "parentId": None, "timestamp": "t1",
+             "message": {"role": "user", "content": "kept"}},
+        ])
+        with self.assertRaises(ValueError):
+            conversation.read_conversation(self.fixture_path(body + "not-json\n"))
+
+    def test_missing_session_header_raises(self):
+        body = self.lines([
+            {"type": "message", "id": "h1", "parentId": None, "timestamp": "t1",
+             "message": {"role": "user", "content": "orphan"}},
+        ])
+        with self.assertRaises(ValueError):
+            conversation.read_conversation(self.fixture_path(body))
+
+    def test_incomplete_final_record_is_ignored(self):
+        body = self.lines([
+            {"type": "session", "version": 3, "id": "TAIL", "timestamp": "t", "cwd": "/tmp"},
+            {"type": "message", "id": "t1", "parentId": None, "timestamp": "t1",
+             "message": {"role": "user", "content": "complete"}},
+        ])
+        truncated = conversation.read_conversation(self.fixture_path(body + '{"type":"message","id":"t2"'))
+        self.assertEqual([message["id"] for message in truncated["messages"]], ["t1"])
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        raw = Path(directory.name) / "invalid-utf8.jsonl"
+        raw.write_bytes(body.encode("utf-8") + b'{"type":"message","id":"t2","content":"\xff\xfe')
+        self.assertEqual([message["id"] for message in conversation.read_conversation(raw)["messages"]], ["t1"])
+
+    def test_active_branch_excludes_abandoned_sibling(self):
+        payload = conversation.read_conversation(self.dag_fixture())
+        self.assertEqual(payload["session"], self.SESSION_ID)
+        self.assertEqual(payload["messages"], self.expected_messages())
+        self.assertNotIn("ABANDONED_SIBLING", self.joined_text(payload))
+
+    def test_metadata_excluded(self):
+        text = self.joined_text(conversation.read_conversation(self.dag_fixture()))
+        for hidden in ("SECRET_THINKING", "HIDDEN_CONTEXT", "dev directive", "PARTIAL"):
+            self.assertNotIn(hidden, text)
+
+    def test_code_and_tool_content_preserved(self):
+        payload = conversation.read_conversation(self.dag_fixture())
+        by_id = {}
+        for message in payload["messages"]:
+            by_id.setdefault(message["id"], []).append(message)
+        self.assertIn("<files>", by_id["e1"][0]["text"])
+        self.assertEqual(by_id["e2"][0]["text"], self.FENCED)
+        self.assertIn("<system-reminder>", by_id["e2"][0]["text"])
+        self.assertEqual([message["name"] for message in by_id["e2"] + by_id["e3"]
+                          if message["role"] == "tool"], ["read", "read"])
+
+    def test_reset_boundary_collapses_to_clean_screen(self):
+        records = [
+            {"type": "session", "version": 3, "id": "RFIX", "timestamp": "t", "cwd": "/tmp"},
+            {"type": "message", "id": "r1", "parentId": None, "timestamp": "t1",
+             "message": {"role": "user", "content": "OLD_BEFORE_CLEAR"}},
+            {"type": "reset_boundary", "id": "r2", "parentId": "r1", "timestamp": "t2"},
+            {"type": "message", "id": "r3", "parentId": "r2", "timestamp": "t3",
+             "message": {"role": "user", "content": "new after clear"}},
+        ]
+        body = self.lines(records)
+        payload = conversation.read_conversation(self.fixture_path(body))
+        self.assertEqual(payload["session"], "RFIX")
+        self.assertEqual(payload["messages"],
+                         [{"id": "r3", "role": "user", "text": "new after clear", "format": "markdown"}])
+        self.assertNotIn("OLD_BEFORE_CLEAR", self.joined_text(payload))
+
+    def test_missing_file_raises(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        with self.assertRaises(FileNotFoundError):
+            conversation.read_conversation(Path(directory.name) / "absent.jsonl")
+
+    @staticmethod
+    def joined_text(payload):
+        return "".join(message["text"] for message in payload["messages"])
 
 
 if __name__ == "__main__":

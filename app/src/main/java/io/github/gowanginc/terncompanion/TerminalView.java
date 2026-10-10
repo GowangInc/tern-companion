@@ -21,6 +21,9 @@ import android.widget.FrameLayout;
 
 import androidx.annotation.NonNull;
 
+import org.commonmark.parser.Parser;
+import org.commonmark.renderer.html.HtmlRenderer;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
@@ -37,6 +40,11 @@ import java.util.regex.Pattern;
  * pre/span/br whitelist with a short inline-style allow-list before they reach
  * the DOM; no navigation, no network, no bridges. Older bridges that still
  * answer with plain text are shown escaped through the same pane.
+ *
+ * Conversation captures are rendered locally as role-separated cards: roles come
+ * from a fixed set, every label and text is escaped, and CommonMark markdown is
+ * rendered with raw HTML escaped and URLs sanitized (tool/context parts stay
+ * folded in a details block).
  *
  * Updates replace the DOM in place (never reload the page). The reader's
  * scroll position is preserved while browsing history; new output only pulls
@@ -62,6 +70,11 @@ public final class TerminalView extends FrameLayout {
     private static final Pattern STYLE_ATTR_RE = Pattern.compile("(?is)style\\s*=\\s*\"([^\"]*)\"");
     private static final Pattern SAFE_VALUE_RE = Pattern.compile("^[a-zA-Z0-9#.,%()\\- ]+$");
 
+    /** Root class that lifts the pane out of terminal whitespace into chat prose. */
+    private static final String CONVO_CLASS = "convo";
+    private static final Set<String> CONVO_ROLES =
+            new HashSet<>(Arrays.asList("user", "assistant", "tool", "context"));
+
     private static final String SHELL_HEAD = "<!doctype html><html><head><meta charset=\"utf-8\">"
             + "<meta http-equiv=\"Content-Security-Policy\" content=\""
             + "default-src 'none'; img-src 'none'; font-src 'none'; connect-src 'none';"
@@ -71,12 +84,59 @@ public final class TerminalView extends FrameLayout {
             + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0,"
             + " maximum-scale=10.0, user-scalable=yes\">"
             + "<style>html,body{margin:0;padding:0;background:" + BG + ";overflow:auto}"
-            + "pre{margin:0;padding:0;font-family:monospace;font-size:16px;line-height:1.5;"
+            + "#t{margin:0;padding:0;font-family:monospace;font-size:16px;line-height:1.5;"
             + "white-space:pre-wrap;overflow-wrap:anywhere;color:" + INK + ";}"
             + "#t pre{font:inherit;margin:0;padding:0;}"
-            + "::selection{background:#d5e2d5;color:" + INK + ";}</style></head><body>";
+            + "::selection{background:#d5e2d5;color:" + INK + ";}"
+            // Conversation cards: prose whitespace, quiet role separation, no extra frames.
+            + "#t.convo{font-family:system-ui,sans-serif;white-space:normal;"
+            + "overflow-wrap:break-word;line-height:1.55;font-size:16px;}"
+            + "#t.convo .msg{margin:0 0 10px;padding:6px 10px;border-radius:8px;"
+            + "border-left:3px solid #c9d3cc;background:#faf8f2;}"
+            + "#t.convo .who{font-size:0.78em;font-weight:bold;letter-spacing:0.06em;"
+            + "text-transform:uppercase;color:#5d6b64;}"
+            + "#t.convo .name{font-weight:normal;letter-spacing:0;text-transform:none;"
+            + "margin-left:8px;color:#806022;overflow-wrap:anywhere;}"
+            + "#t.convo .user{border-left-color:#17634e;background:#f1f5f0;}"
+            + "#t.convo .assistant{border-left-color:#365e7a;background:#f3f5f7;}"
+            + "#t.convo .tool,#t.convo .context,#t.convo .other{border-left-color:#c2bcae;"
+            + "background:#f6f4ed;}"
+            + "#t.convo details{margin:0;}"
+            + "#t.convo summary{cursor:pointer;color:#5d6b64;font-size:0.78em;min-height:48px;"
+            + "font-weight:bold;letter-spacing:0.06em;text-transform:uppercase;}"
+            + "#t.convo summary:focus-visible{outline:2px solid #17634e;}"
+            + "#t.convo .body{margin-top:4px;}"
+            + "#t.convo .msg.tool .body,#t.convo .msg.context .body,#t.convo .msg.other .body"
+            + "{font-family:monospace;font-size:0.85em;white-space:pre-wrap;"
+            + "overflow-wrap:anywhere;max-height:14em;overflow:auto;background:#efece2;"
+            + "padding:6px 8px;border-radius:6px;}"
+            + "#t.convo h1,#t.convo h2,#t.convo h3,#t.convo h4,#t.convo h5,#t.convo h6"
+            + "{margin:0.7em 0 0.3em;line-height:1.25;}"
+            + "#t.convo h1{font-size:1.35em;}#t.convo h2{font-size:1.2em;}"
+            + "#t.convo h3{font-size:1.08em;}#t.convo h4,#t.convo h5,#t.convo h6{font-size:1em;}"
+            + "#t.convo p{margin:0.45em 0;}"
+            + "#t.convo ul,#t.convo ol{margin:0.45em 0;padding-left:1.5em;}"
+            + "#t.convo li{margin:0.15em 0;}"
+            + "#t.convo blockquote{margin:0.45em 0;padding-left:0.8em;"
+            + "border-left:2px solid #d8d2c4;color:#5d6b64;}"
+            + "#t.convo .plain{white-space:pre-wrap;overflow-wrap:anywhere;}"
+            + "#t.convo code{font-family:monospace;font-size:0.92em;background:#efece2;"
+            + "border-radius:3px;padding:0 3px;}"
+            + "#t.convo pre{font-family:monospace;font-size:0.85em;line-height:1.45;"
+            + "white-space:pre;overflow-x:auto;background:#efece2;padding:6px 8px;"
+            + "border-radius:6px;}"
+            + "#t.convo pre code{background:none;padding:0;font-size:1em;}"
+            + "#t.convo hr{border:0;border-top:1px solid #d8d2c4;margin:0.7em 0;}"
+            + "#t.convo table{border-collapse:collapse;font-size:0.9em;}"
+            + "#t.convo th,#t.convo td{border:1px solid #d8d2c4;padding:2px 6px;}"
+            + "#t.convo a{color:#365e7a;}"
+            + "#t.convo img{max-width:100%;height:auto;}"
+            + "</style></head><body>";
     private static final String SHELL_SCRIPT =
-            "<script>function tSet(h){document.getElementById('t').innerHTML=h;}</script>";
+            "<script>function tSet(h){const t=document.getElementById('t');"
+            + "const open=new Set(Array.from(t.querySelectorAll('details[open]')).map(d=>d.dataset.key));"
+            + "t.innerHTML=h;t.querySelectorAll('details').forEach(d=>{d.open=open.has(d.dataset.key);});}"
+            + "function tMode(c){document.getElementById('t').className=c;}</script>";
 
     public interface OnTailChangeListener {
         void onTailChange(boolean atTail);
@@ -88,8 +148,8 @@ public final class TerminalView extends FrameLayout {
     private final float fontScale;
     private OnTailChangeListener tailListener;
     private boolean loaded;
-    private boolean showsPlain;
     private String lastFragment = "";
+    private String lastClass = "";
     private int textSizeSp = 16;
     private float sizeRatio;
     private boolean resizingText;
@@ -184,36 +244,111 @@ public final class TerminalView extends FrameLayout {
 
     /** Injects a bridge HTML capture after whitelist sanitization. Safe to call repeatedly. */
     public void loadCapture(@NonNull String html) {
-        showsPlain = false;
-        loadFragment(sanitize(html));
+        loadFragment(sanitize(html), "");
     }
 
-    /** Shows a plain-text capture (older bridge) escaped, in the same pane. */
-    public void loadPlainText(@NonNull String text) {
-        showsPlain = true;
-        loadFragment(escape(text));
+    /** Injects a bridge conversation payload (quiet role-separated cards). */
+    public void loadConversation(@NonNull JSONObject payload) {
+        loadFragment(conversationHtml(payload), CONVO_CLASS);
     }
 
-    /** True after {@link #loadPlainText} until the next {@link #loadCapture}. */
-    public boolean showsPlainText() {
-        return showsPlain;
+    /** Lets a paged conversation return to the live page instead of its local tail. */
+    public void setOnJumpToLatestListener(Runnable action) {
+        jumpFab.setOnClickListener(v -> action.run());
     }
 
-    private void loadFragment(String fragment) {
+    /**
+     * Renders a conversation payload into card HTML. Nothing from the payload is
+     * interpolated as markup, as a class name, or as a fetchable URL: role classes
+     * come from a fixed set, every label/name/text is escaped, and the markdown
+     * renderer escapes raw HTML and sanitizes link/image URLs.
+     */
+    static String conversationHtml(JSONObject payload) {
+        JSONArray messages = payload == null ? null : payload.optJSONArray("messages");
+        if (messages == null || messages.length() == 0) {
+            return "<div class=\"msg context\"><span class=\"who\">Session</span>"
+                    + "<div class=\"body\">No messages captured for this session.</div></div>";
+        }
+        StringBuilder out = new StringBuilder();
+        int start = payload.optInt("start");
+        for (int i = 0; i < messages.length(); i++) {
+            JSONObject message = messages.optJSONObject(i);
+            if (message == null) continue;
+            String role = message.optString("role", "");
+            String name = message.optString("name", "").trim();
+            String text = message.optString("text", "");
+            String kind = CONVO_ROLES.contains(role) ? role : "other";
+            boolean folded = !"user".equals(kind) && !"assistant".equals(kind);
+            out.append("<div class=\"msg ").append(kind).append("\">");
+            if (folded) {
+                // Tool/context parts keep every character but stay folded until tapped.
+                String key = escape(message.optString("id") + ":" + kind + ":" + (start + i))
+                        .replace("\"", "&quot;");
+                out.append("<details data-key=\"").append(key).append("\"><summary><span class=\"who\">")
+                        .append(who(kind, role, name))
+                        .append("</span></summary><pre class=\"body\">").append(escape(text))
+                        .append("</pre></details>");
+            } else {
+                out.append("<div class=\"who\">").append(who(kind, role, name)).append("</div>")
+                        .append("<div class=\"body\">")
+                        .append(body(text, message.optString("format", "text"))).append("</div>");
+            }
+            out.append("</div>");
+        }
+        return out.toString();
+    }
+
+    /** Escaped role label (fixed wording for known roles) plus the optional name. */
+    private static String who(String kind, String role, String name) {
+        String label;
+        if ("user".equals(kind)) {
+            label = "You";
+        } else if ("assistant".equals(kind)) {
+            label = "Assistant";
+        } else if ("tool".equals(kind)) {
+            label = "Tool";
+        } else if ("context".equals(kind)) {
+            label = "Context";
+        } else {
+            String trimmed = role.trim();
+            label = trimmed.isEmpty() ? "Note"
+                    : trimmed.length() > 32 ? trimmed.substring(0, 32) + "\u2026" : trimmed;
+        }
+        StringBuilder out = new StringBuilder(escape(label));
+        if (!name.isEmpty()) out.append("<span class=\"name\">").append(escape(name)).append("</span>");
+        return out.toString();
+    }
+
+    private static String body(String text, String format) {
+        if ("markdown".equals(format)) return Markdown.toHtml(text);
+        // Non-markdown parts are verbatim: their line structure has to survive.
+        return "<div class=\"plain\">" + escape(text) + "</div>";
+    }
+
+    private void loadFragment(String fragment, String rootClass) {
         if (!loaded) {
-            lastFragment = fragment;
             loaded = true;
+            lastFragment = fragment;
+            lastClass = rootClass;
+            String shellClass = rootClass.isEmpty() ? "" : " class=\"" + rootClass + "\"";
             webView.loadDataWithBaseURL("about:blank",
-                    SHELL_HEAD + "<pre id=\"t\">" + fragment + "</pre>" + SHELL_SCRIPT + "</body></html>",
+                    SHELL_HEAD + "<div id=\"t\"" + shellClass + ">" + fragment + "</div>"
+                            + SHELL_SCRIPT + "</body></html>",
                     "text/html", "utf-8", null);
             return;
         }
-        if (fragment.equals(lastFragment)) return; // refresh only when content changed
+        if (fragment.equals(lastFragment) && rootClass.equals(lastClass)) return;
         boolean tail = resizingText ? resizeAtTail : isAtTail();
         webView.removeCallbacks(sizeRestore); // new layout makes a queued ratio stale
         resizingText = false;
-        lastFragment = fragment;
-        webView.evaluateJavascript("tSet(" + JSONObject.quote(fragment) + ")", null);
+        if (!rootClass.equals(lastClass)) {
+            lastClass = rootClass;
+            webView.evaluateJavascript("tMode(" + JSONObject.quote(rootClass) + ")", null);
+        }
+        if (!fragment.equals(lastFragment)) {
+            lastFragment = fragment;
+            webView.evaluateJavascript("tSet(" + JSONObject.quote(fragment) + ")", null);
+        }
         if (tail) webView.postDelayed(this::scrollToTail, TAIL_SETTLE_MS);
     }
 
@@ -298,6 +433,20 @@ public final class TerminalView extends FrameLayout {
     /** Shows or hides the built-in Jump-to-latest overlay. */
     public void setJumpToLatestVisible(boolean visible) {
         jumpFab.setVisibility(visible ? VISIBLE : GONE);
+    }
+
+    /** Lazily built CommonMark pipeline: one parser, one inert HTML renderer. */
+    private static final class Markdown {
+        private static final Parser PARSER = Parser.builder().build();
+        private static final HtmlRenderer RENDERER = HtmlRenderer.builder()
+                .escapeHtml(true)    // raw HTML in a message stays literal text, never markup
+                .sanitizeUrls(true)  // javascript:/file: URLs blanked; http(s)/mailto/data survive
+                .softbreak("<br />") // keep the author's line breaks inside a paragraph
+                .build();
+
+        static String toHtml(String text) {
+            return RENDERER.render(PARSER.parse(text));
+        }
     }
 
     // ---------- sanitization ----------
