@@ -59,7 +59,12 @@ import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.regex.Pattern;
@@ -319,23 +324,29 @@ public final class MainActivity extends Activity {
         page.addView(headerWithBack(h.name, () -> showHosts()));
 
         List<SessionGroups.Group> groups = SessionGroups.group(sessions);
-        List<SessionGroups.Group> normal = SessionGroups.normal(groups);
-        List<SessionGroups.Group> background = SessionGroups.background(groups);
+        Set<String> hiddenSessions = hiddenSet(SessionGroups.hiddenSessionsKey(h.baseUrl()));
+        Set<String> hiddenBlocks = hiddenSet(SessionGroups.hiddenBlocksKey(h.baseUrl()));
+        List<SessionGroups.Group> normal = SessionGroups.visible(groups, false, hiddenSessions, hiddenBlocks);
+        List<SessionGroups.Group> background = SessionGroups.visible(groups, true, hiddenSessions, hiddenBlocks);
         int live = 0;
-        for (SessionGroups.Group group : groups) live += group.liveCount();
+        for (SessionGroups.Group group : normal) live += group.liveCount();
+        for (SessionGroups.Group group : background) live += group.liveCount();
+        int hidden = hiddenSessions.size() + hiddenBlocks.size();
 
         page.addView(brow("LIVE SESSIONS"), mp(-1, -2, 0, 18, 0, 0));
-        page.addView(note(countLine(live, normal.size(), background.size()), 13), mp(-1, -2, 0, 8, 0, 4));
+        page.addView(note(countLine(live, normal.size(), background.size(), hidden), 13), mp(-1, -2, 0, 8, 0, 4));
         page.addView(rule(), mp(-1, dp1(), 0, 12, 0, 20));
 
         for (SessionGroups.Group group : normal) page.addView(sessionCard(h, group), mp(-1, -2, 0, 0, 0, 16));
-        if (normal.isEmpty()) page.addView(note("No live sessions on this PC.", 14), mp(-1, -2, 0, 0, 0, 16));
+        if (normal.isEmpty()) page.addView(note(hidden == 0 ? "No live sessions on this PC."
+                : "No visible sessions on this PC — restore one from Hidden sessions/agents.", 14), mp(-1, -2, 0, 0, 0, 16));
 
         if (showBackground) {
             page.addView(brow("BACKGROUND SESSIONS"), mp(-1, -2, 0, 8, 0, 0));
             page.addView(note("Flow and background sessions. Hidden by default; nothing is stopped or removed.", 13),
                     mp(-1, -2, 0, 8, 0, 12));
-            if (background.isEmpty()) page.addView(note("No background sessions.", 14), mp(-1, -2, 0, 0, 0, 16));
+            if (background.isEmpty()) page.addView(note(hidden == 0 ? "No background sessions."
+                    : "No visible background sessions.", 14), mp(-1, -2, 0, 0, 0, 16));
             for (SessionGroups.Group group : background) page.addView(sessionCard(h, group), mp(-1, -2, 0, 0, 0, 16));
         }
 
@@ -349,6 +360,14 @@ public final class MainActivity extends Activity {
         });
         page.addView(toggle, mp(-1, -2, 0, 8, 0, 8));
 
+        Button hiddenBtn = button(hidden == 0 ? "Hidden sessions/agents"
+                : "Hidden sessions/agents (" + hidden + ")");
+        hiddenBtn.setContentDescription("Restore sessions and agents hidden on this phone");
+        hiddenBtn.setOnClickListener(v -> showHiddenDialog(h));
+        page.addView(hiddenBtn, mp(-1, -2, 0, 8, 0, 8));
+        page.addView(note("Hiding is phone-only: your PC keeps every session running. Nothing is stopped or deleted.", 13),
+                mp(-1, -2, 0, 0, 0, 12));
+
         Button again = button("↻   Refresh");
         again.setOnClickListener(v -> connect(h));
         page.addView(again, mp(-1, -2, 0, 8, 0, 0));
@@ -359,6 +378,142 @@ public final class MainActivity extends Activity {
         status = note("", 13);
         page.addView(status, mp(-1, -2, 0, 16, 0, 0));
         page.addView(footnote());
+    }
+
+    // ---------- hidden sessions and agents (this phone only) ----------
+
+    /** A defensive copy of one PC's hidden set; SharedPreferences sets stay live. */
+    private Set<String> hiddenSet(String key) {
+        Set<String> stored = preferences.getStringSet(key, null);
+        return stored == null ? new HashSet<>() : new HashSet<>(stored);
+    }
+
+    private void saveHidden(String key, Set<String> ids) {
+        preferences.edit().putStringSet(key, new HashSet<>(ids)).apply();
+    }
+
+    /** Re-draws the list already on screen, or reconnects when there is none. */
+    private void refreshSessions(Host h) {
+        if (lastSessions != null && lastHost != null && lastHost.baseUrl().equals(h.baseUrl())) {
+            showSessions(h, lastSessions);
+        } else {
+            connect(h);
+        }
+    }
+
+    private void hideSession(Host h, SessionGroups.Group group) {
+        String key = SessionGroups.hiddenSessionsKey(h.baseUrl());
+        Set<String> ids = hiddenSet(key);
+        ids.add(group.id);
+        saveHidden(key, ids);
+        refreshSessions(h);
+        status("Hid “" + group.name + "” on this phone. It keeps running on " + h.name + ".");
+    }
+
+    private void hideBlock(Host h, SessionGroups.Group group, SessionGroups.Block block) {
+        String key = SessionGroups.hiddenBlocksKey(h.baseUrl());
+        Set<String> ids = hiddenSet(key);
+        ids.add(SessionGroups.blockKey(group.id, block.blockId));
+        saveHidden(key, ids);
+        refreshSessions(h);
+        status("Hid “" + block.label + "” on this phone. It keeps running on " + h.name + ".");
+    }
+
+    private void restoreSession(Host h, String id) {
+        String key = SessionGroups.hiddenSessionsKey(h.baseUrl());
+        Set<String> ids = hiddenSet(key);
+        if (ids.remove(id)) saveHidden(key, ids);
+        refreshSessions(h);
+        status("Restored on this phone.");
+    }
+
+    private void restoreBlock(Host h, String blockKey) {
+        String key = SessionGroups.hiddenBlocksKey(h.baseUrl());
+        Set<String> ids = hiddenSet(key);
+        if (ids.remove(blockKey)) saveHidden(key, ids);
+        refreshSessions(h);
+        status("Restored on this phone.");
+    }
+
+    /** Restores every agent hidden inside one session, stale entries included. */
+    private void restoreSessionBlocks(Host h, SessionGroups.Group group) {
+        String key = SessionGroups.hiddenBlocksKey(h.baseUrl());
+        Set<String> ids = hiddenSet(key);
+        boolean changed = false;
+        for (String id : new ArrayList<>(ids)) if (id.startsWith(group.id + "/")) changed |= ids.remove(id);
+        if (!changed) return;
+        saveHidden(key, ids);
+        refreshSessions(h);
+        status("Restored the hidden agents in “" + group.name + "” on this phone.");
+    }
+
+    private void restoreAllHidden(Host h) {
+        preferences.edit()
+                .remove(SessionGroups.hiddenSessionsKey(h.baseUrl()))
+                .remove(SessionGroups.hiddenBlocksKey(h.baseUrl()))
+                .apply();
+        refreshSessions(h);
+        status("All hidden entries restored on this phone.");
+    }
+
+    /** Lists this PC's hidden entries; tap one to restore it. */
+    private void showHiddenDialog(Host h) {
+        if (lastSessions == null || lastHost == null) {
+            status("Connect to " + h.name + " to restore hidden sessions.");
+            return;
+        }
+        final Set<String> sessions = hiddenSet(SessionGroups.hiddenSessionsKey(h.baseUrl()));
+        final Set<String> blocks = hiddenSet(SessionGroups.hiddenBlocksKey(h.baseUrl()));
+        if (sessions.isEmpty() && blocks.isEmpty()) {
+            status("Nothing is hidden on " + h.name + ".");
+            return;
+        }
+        Map<String, String> sessionNames = new HashMap<>();
+        Map<String, String> blockNames = new HashMap<>();
+        for (SessionGroups.Group group : SessionGroups.group(lastSessions)) {
+            sessionNames.put(group.id, group.name);
+            for (SessionGroups.Block block : group.blocks) {
+                blockNames.put(SessionGroups.blockKey(group.id, block.blockId), block.label);
+            }
+        }
+        final List<String> sessionIds = new ArrayList<>(new TreeSet<>(sessions));
+        final List<String> blockKeys = new ArrayList<>(new TreeSet<>(blocks));
+        List<String> labels = new ArrayList<>();
+        for (String id : sessionIds) {
+            String name = sessionNames.get(id);
+            labels.add("Session · " + (name == null ? id + "  (not on this PC now)" : name));
+        }
+        for (String key : blockKeys) {
+            String label = blockNames.get(key);
+            labels.add("Agent · " + (label == null ? key + "  (not on this PC now)" : label));
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Hidden on this phone")
+                .setItems(labels.toArray(new String[0]), (d, which) -> {
+                    if (which < sessionIds.size()) restoreSession(h, sessionIds.get(which));
+                    else restoreBlock(h, blockKeys.get(which - sessionIds.size()));
+                })
+                .setNegativeButton("Close", null)
+                .setNeutralButton("Restore all", (d, w) -> restoreAllHidden(h))
+                .show();
+    }
+
+    /** Per-session menu: hiding is local to this phone and reversible here. */
+    private void sessionMenu(Host h, SessionGroups.Group group) {
+        new AlertDialog.Builder(this)
+                .setTitle("Session · " + group.name + " · phone only")
+                .setItems(new String[]{"Hide this session"}, (d, which) -> hideSession(h, group))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** Per-agent menu, also reached by long-pressing the agent row. */
+    private void agentMenu(Host h, SessionGroups.Group group, SessionGroups.Block block) {
+        new AlertDialog.Builder(this)
+                .setTitle("Agent · " + block.label + " · phone only")
+                .setItems(new String[]{"Hide this agent"}, (d, which) -> hideBlock(h, group, block))
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     private void newSessionDialog(final Host h) {
@@ -411,10 +566,16 @@ public final class MainActivity extends Activity {
         name.setSingleLine(true);
         name.setEllipsize(TextUtils.TruncateAt.END);
         head.addView(name, weight1());
-        TextView count = text(group.liveCount() == 0 ? "NO LIVE BLOCKS" : group.liveCount() + " LIVE",
-                11, GREEN, Typeface.MONOSPACE, Typeface.BOLD);
+        TextView count = text(countLabel(group), 11, group.liveCount() == 0 ? MUTED : GREEN,
+                Typeface.MONOSPACE, Typeface.BOLD);
         count.setLetterSpacing(0.10f);
         head.addView(count);
+        Button sessionOpts = smallButton("⋮");
+        sessionOpts.setTextSize(18);
+        sessionOpts.setContentDescription("Session options for " + group.name);
+        sessionOpts.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2217634e), null, bg(Color.WHITE, Color.TRANSPARENT)));
+        sessionOpts.setOnClickListener(v -> sessionMenu(h, group));
+        head.addView(sessionOpts, new LinearLayout.LayoutParams(dp(48), dp(48)));
         card.addView(head);
         SessionGroups.Block current = group.current();
         if (current != null) {
@@ -423,25 +584,53 @@ public final class MainActivity extends Activity {
         }
         for (int i = 0; i < group.blocks.size(); i++) {
             SessionGroups.Block block = group.blocks.get(i);
-            LinearLayout blockRow = column();
+            LinearLayout blockRow = row();
             blockRow.setFocusable(true);
             blockRow.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2217634e), null, null));
             blockRow.setContentDescription("Open " + block.label + " in " + group.name);
+            LinearLayout blockText = column();
             TextView label = text((block.focused ? "● " : "") + block.label, 16, INK, Typeface.DEFAULT_BOLD);
             label.setSingleLine(true);
             label.setEllipsize(TextUtils.TruncateAt.END);
-            blockRow.addView(label);
-            blockRow.addView(text(blockSub(block), 12, MUTED, Typeface.MONOSPACE), mp(-1, -2, 0, 6, 0, 0));
+            blockText.addView(label);
+            blockText.addView(text(blockSub(block), 12, MUTED, Typeface.MONOSPACE), mp(-1, -2, 0, 6, 0, 0));
+            blockRow.addView(blockText, weight1());
+            Button agentOpts = smallButton("⋮");
+            agentOpts.setTextSize(18);
+            agentOpts.setContentDescription("Agent options for " + block.label);
+            agentOpts.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2217634e), null, bg(Color.WHITE, Color.TRANSPARENT)));
+            agentOpts.setOnClickListener(v -> agentMenu(h, group, block));
+            blockRow.addView(agentOpts, new LinearLayout.LayoutParams(dp(48), dp(48)));
             blockRow.setOnClickListener(v -> showBlock(h, group.name, block.blockId, block.label));
+            blockRow.setOnLongClickListener(v -> {
+                agentMenu(h, group, block);
+                return true;
+            });
             card.addView(blockRow, mp(-1, -2, 0, i == 0 ? 12 : 10, 0, 0));
+        }
+        if (group.hiddenBlocks > 0) {
+            Button restore = smallButton("Restore " + group.hiddenBlocks
+                    + (group.hiddenBlocks == 1 ? " hidden agent" : " hidden agents"));
+            restore.setContentDescription("Restore agents hidden in " + group.name);
+            restore.setOnClickListener(v -> restoreSessionBlocks(h, group));
+            card.addView(restore, mp(-1, dp(48), 0, 12, 0, 0));
         }
         return card;
     }
 
-    private static String countLine(int live, int sessions, int background) {
+    /** The header count, always the visible agents, plus what this phone hides. */
+    private static String countLabel(SessionGroups.Group group) {
+        String live = group.liveCount() == 0 ? "NO LIVE BLOCKS" : group.liveCount() + " LIVE";
+        if (group.hiddenBlocks == 0) return live;
+        return group.liveCount() == 0 ? "ALL " + group.hiddenBlocks + " HIDDEN"
+                : live + "  ·  " + group.hiddenBlocks + " HIDDEN";
+    }
+
+    private static String countLine(int live, int sessions, int background, int hidden) {
         return live + (live == 1 ? " live block" : " live blocks") + "  ·  " + sessions
                 + (sessions == 1 ? " session" : " sessions")
-                + (background == 0 ? "" : "  ·  " + background + " background");
+                + (background == 0 ? "" : "  ·  " + background + " background")
+                + (hidden == 0 ? "" : "  ·  " + hidden + " hidden");
     }
 
     private static String blockSub(SessionGroups.Block block) {

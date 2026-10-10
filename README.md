@@ -8,8 +8,8 @@ The Android app talks to `tern_bridge.py` on your computer. The bridge uses Tern
 
 - Save multiple computers with encrypted credentials.
 - Pair with a camera QR scan or a saved QR image.
-- Group live terminal blocks by session. Hide Flow/background sessions until you enable the toggle below the list.
-- Read clean OMP chats with Markdown, image previews, file cards and collapsed technical activity; ordinary terminal blocks retain their terminal view.
+- Group live terminal blocks by session. Use each session/agent’s **⋮** menu to hide it on this phone; restore it from **Hidden sessions/agents**. Desktop sessions keep running. Flow/background sessions remain behind their separate toggle.
+- Read clean OMP chats with Markdown headings, tables, quotes, labelled code blocks, image previews, file cards and collapsed technical activity; ordinary terminal blocks retain their terminal view.
 - Write multiline messages and submit with **Send**. Use Android’s native text-selection menu to paste without submitting.
 - Attach images or files through the system picker, including multi-select and image-only messages.
 - Open **Tools** for Enter, Ctrl+C, Escape, Tab, arrow keys and **Ctrl+P** for compatible model cycling.
@@ -174,6 +174,16 @@ python3 checks/check_terminal_settings.py --serial YOUR_ADB_SERIAL
 This exercises the native slider, preview, persistence and reset, restores the original font size, and force-stops the app. It does not change saved PCs or open backend sessions.
 
 A release APK must retain the publisher’s signing identity. Local debug APKs use a different signer and cannot receive production-signed updates in place.
+
+## 1.5.1 changes
+
+Added persistent, per-computer phone-only hiding for individual sessions and agent entries, with individual and **Restore all** controls. Hiding never stops or deletes anything on the desktop.
+
+Improved chat typography, Markdown tables, blockquotes and fenced-code labels. OMP receipt checks now match the native editor’s trimming of surrounding whitespace while preserving internal line breaks and indentation.
+
+Messages show their saved timestamps in the phone’s local time. Collapsed activity shows its first–last timestamp range; old records without a valid timestamp remain readable without an invented time.
+
+PC-linked raster images and native/tool image payloads now appear as authenticated, session-bound previews. External image URLs, code fences and non-image files are not loaded as previews.
 
 ## 1.5.0 changes
 

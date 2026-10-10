@@ -22,12 +22,19 @@ import android.widget.FrameLayout;
 
 import androidx.annotation.NonNull;
 
+import org.commonmark.Extension;
+import org.commonmark.ext.gfm.tables.TablesExtension;
 import org.commonmark.parser.Parser;
 import org.commonmark.renderer.html.HtmlRenderer;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
+import java.time.DateTimeException;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -103,6 +110,9 @@ public final class TerminalView extends FrameLayout {
             "[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}");
     private static final Set<String> RASTER_MIME = new HashSet<>(Arrays.asList(
             "image/png", "image/jpeg", "image/webp", "image/gif"));
+    private static final DateTimeFormatter STAMP_FORMAT =
+            DateTimeFormatter.ofPattern("d MMM · HH:mm:ss", Locale.getDefault());
+    private static final DateTimeFormatter CLOCK_FORMAT = DateTimeFormatter.ofPattern("HH:mm:ss");
 
     private static final String SHELL_HEAD = "<!doctype html><html><head><meta charset=\"utf-8\">"
             + "<meta http-equiv=\"Content-Security-Policy\" content=\""
@@ -112,7 +122,8 @@ public final class TerminalView extends FrameLayout {
             + " style-src 'unsafe-inline'; script-src 'unsafe-inline'\">"
             + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0,"
             + " maximum-scale=10.0, user-scalable=yes\">"
-            + "<style>html,body{margin:0;padding:0;background:" + BG + ";overflow:auto}"
+            + "<style>html,body{margin:0;padding:0;background:" + BG
+            + ";overflow-x:hidden;overflow-y:auto}"
             + "#t{margin:0;padding:0;font-family:monospace;font-size:16px;line-height:1.5;"
             + "white-space:pre-wrap;overflow-wrap:anywhere;color:" + INK + ";}"
             + "#t pre{font:inherit;margin:0;padding:0;}"
@@ -128,6 +139,8 @@ public final class TerminalView extends FrameLayout {
             + "text-transform:uppercase;color:#6b7770;margin:0 0 4px;}"
             + "#t.convo .name{font-weight:400;letter-spacing:0;text-transform:none;margin-left:6px;"
             + "color:#8a6f33;overflow-wrap:anywhere;}"
+            + "#t.convo .stamp{margin-left:8px;font-weight:400;letter-spacing:0;"
+            + "text-transform:none;white-space:nowrap;}"
             + "#t.convo .msg.user{display:flex;flex-direction:column;align-items:flex-end;}"
             + "#t.convo .user .who{text-align:right;}"
             + "#t.convo .user .body{max-width:88%;background:#e6ece1;border-radius:14px 14px 4px 14px;"
@@ -144,25 +157,44 @@ public final class TerminalView extends FrameLayout {
             + "font-size:0.82em;white-space:pre-wrap;overflow-wrap:anywhere;max-height:16em;"
             + "overflow:auto;background:#efece2;padding:6px 8px;border-radius:6px;}"
             + "#t.convo h1,#t.convo h2,#t.convo h3,#t.convo h4,#t.convo h5,#t.convo h6"
-            + "{margin:0.7em 0 0.3em;line-height:1.25;}"
-            + "#t.convo h1{font-size:1.35em;}#t.convo h2{font-size:1.2em;}"
-            + "#t.convo h3{font-size:1.08em;}#t.convo h4,#t.convo h5,#t.convo h6{font-size:1em;}"
-            + "#t.convo p{margin:0.45em 0;}"
-            + "#t.convo ul,#t.convo ol{margin:0.45em 0;padding-left:1.5em;}"
-            + "#t.convo li{margin:0.15em 0;}"
-            + "#t.convo blockquote{margin:0.45em 0;padding-left:0.8em;"
-            + "border-left:2px solid #d8d2c4;color:#5d6b64;}"
-            + "#t.convo hr{border:0;border-top:1px solid #d8d2c4;margin:0.7em 0;}"
-            + "#t.convo table{display:block;overflow-x:auto;border-collapse:collapse;font-size:0.9em;}"
-            + "#t.convo th,#t.convo td{border:1px solid #d8d2c4;padding:2px 6px;}"
+            + "{margin:0.85em 0 0.35em;line-height:1.24;}"
+            + "#t.convo h1:first-child,#t.convo h2:first-child,#t.convo h3:first-child,"
+            + "#t.convo h4:first-child,#t.convo h5:first-child,#t.convo h6:first-child{margin-top:0.2em;}"
+            + "#t.convo h1{font-size:1.3em;letter-spacing:-0.01em;padding-bottom:0.12em;"
+            + "border-bottom:1px solid #d8d2c4;}"
+            + "#t.convo h2{font-size:1.15em;font-weight:700;}"
+            + "#t.convo h3{font-size:1.03em;color:#17634e;}"
+            + "#t.convo h4,#t.convo h5,#t.convo h6{font-size:0.97em;color:#5d6b64;}"
+            + "#t.convo p{margin:0.6em 0;}"
+            + "#t.convo strong{font-weight:650;color:#101c19;}"
+            + "#t.convo em{font-style:italic;}"
+            + "#t.convo ul,#t.convo ol{margin:0.55em 0;padding-left:1.45em;}"
+            + "#t.convo li{margin:0.2em 0;}"
+            + "#t.convo li>p{margin:0.2em 0;}"
+            + "#t.convo blockquote{margin:0.6em 0;padding:0.1em 0 0.1em 0.85em;"
+            + "border-left:2px solid #b9c4b2;color:#5d6b64;}"
+            + "#t.convo blockquote p:first-child{margin-top:0;}"
+            + "#t.convo blockquote p:last-child{margin-bottom:0;}"
+            + "#t.convo hr{border:0;border-top:1px solid #d8d2c4;margin:0.85em 0;}"
+            // Wide tables scroll inside their own frame; the page never widens.
+            + "#t.convo table{display:block;width:max-content;max-width:100%;overflow-x:auto;"
+            + "-webkit-overflow-scrolling:touch;border-collapse:collapse;font-size:0.9em;margin:0.6em 0;}"
+            + "#t.convo th,#t.convo td{border:1px solid #d8d2c4;padding:3px 7px;}"
+            + "#t.convo th{background:#efece2;font-weight:600;}"
             + "#t.convo a{color:#365e7a;}"
             + "#t.convo .plain{white-space:pre-wrap;overflow-wrap:anywhere;}"
             + "#t.convo code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"
             + "font-size:0.9em;background:#efece2;border-radius:3px;padding:0 3px;}"
-            // Fenced code scrolls sideways; the pane never becomes one raw dump.
+            // A language-tagged fence gets a labelled frame; an untagged one keeps the
+            // plain frame. Either way the code scrolls sideways, never the page.
+            + "#t.convo .code{margin:0.6em 0;border:1px solid #ded8ca;border-radius:8px;"
+            + "background:#efece2;overflow:hidden;max-width:100%;}"
+            + "#t.convo .code .lang{display:block;font-size:0.68em;font-weight:600;"
+            + "letter-spacing:0.08em;text-transform:uppercase;color:#6b7770;padding:4px 8px 0;}"
             + "#t.convo pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"
             + "font-size:0.84em;line-height:1.45;white-space:pre;overflow-x:auto;"
             + "-webkit-overflow-scrolling:touch;background:#efece2;padding:6px 8px;border-radius:6px;}"
+            + "#t.convo .code pre{margin:0;border-radius:0;background:none;}"
             + "#t.convo pre code{background:none;padding:0;font-size:1em;}"
             + "#t.convo .attach{margin-top:6px;max-width:100%;min-width:0;}"
             + "#t.convo .attach-img{display:block;max-width:100%;max-height:22em;width:auto;"
@@ -174,10 +206,24 @@ public final class TerminalView extends FrameLayout {
             + "#t.convo .attach-meta{font-size:0.82em;color:#6b7770;}"
             + "</style></head><body>";
     private static final String SHELL_SCRIPT =
-            "<script>function tSet(h){const t=document.getElementById('t');"
+            // tAtTail/tTail mirror the Java tail intent; tWatch keeps a late image from
+            // jumping the reading position when the reader is in history.
+            "<script>function tScroller(){return document.scrollingElement||document.documentElement;}"
+            + "function tAtTail(){var d=tScroller();"
+            + "return window.scrollY+window.innerHeight>=d.scrollHeight-8;}"
+            + "function tTail(){window.scrollTo(0,tScroller().scrollHeight);}"
+            + "function tWatch(img){var settle=function(){var r=img.getBoundingClientRect();"
+            + "if(r.top<0){window.scrollBy(0,r.height);}else if(tAtTail()){tTail();}};"
+            + "if(img.complete){settle();}else{img.addEventListener('load',settle);"
+            + "img.addEventListener('error',settle);}}"
+            + "function tSet(h){const t=document.getElementById('t');"
             + "const open=new Set(Array.from(t.querySelectorAll('details[open]')).map(d=>d.dataset.key));"
-            + "t.innerHTML=h;t.querySelectorAll('details').forEach(d=>{d.open=open.has(d.dataset.key);});}"
-            + "function tMode(c){document.getElementById('t').className=c;}</script>";
+            + "var atTail=tAtTail();var before=window.scrollY;t.innerHTML=h;"
+            + "t.querySelectorAll('details').forEach(d=>{d.open=open.has(d.dataset.key);});"
+            + "if(atTail){tTail();}else{window.scrollTo(0,before);}"
+            + "t.querySelectorAll('img').forEach(tWatch);}"
+            + "function tMode(c){document.getElementById('t').className=c;}"
+            + "document.querySelectorAll('#t img').forEach(tWatch);</script>";
 
     public interface OnTailChangeListener {
         void onTailChange(boolean atTail);
@@ -387,8 +433,10 @@ public final class TerminalView extends FrameLayout {
         String text = message.optString("text", "");
         out.append("<div class=\"").append(wrapper).append(' ').append(kind).append("\">")
                 .append("<div class=\"who\">")
-                .append(who(kind, message.optString("role", ""), message.optString("name", "").trim()))
-                .append("</div>");
+                .append(who(kind, message.optString("role", ""), message.optString("name", "").trim()));
+        long saved = timestamp(message);
+        appendTimestamp(out, saved, saved);
+        out.append("</div>");
         // An image-only send arrives with empty text: no empty bubble, just the preview.
         if (!text.trim().isEmpty()) {
             out.append("<div class=\"body\">")
@@ -398,12 +446,47 @@ public final class TerminalView extends FrameLayout {
         out.append("</div>");
     }
 
+    private static long timestamp(JSONObject message) {
+        Object value = message.opt("timestamp");
+        return value instanceof Number ? ((Number) value).longValue() : Long.MIN_VALUE;
+    }
+
+    /** Only saved timestamps are shown, converted to this phone's local time. */
+    private static void appendTimestamp(StringBuilder out, long first, long last) {
+        if (first == Long.MIN_VALUE) return;
+        try {
+            ZonedDateTime start = Instant.ofEpochMilli(first).atZone(ZoneId.systemDefault());
+            ZonedDateTime end = last == Long.MIN_VALUE || last == first ? start
+                    : Instant.ofEpochMilli(last).atZone(start.getZone());
+            String label = STAMP_FORMAT.format(start);
+            if (!end.equals(start)) {
+                label += "–" + (start.toLocalDate().equals(end.toLocalDate())
+                        ? CLOCK_FORMAT.format(end) : STAMP_FORMAT.format(end));
+            }
+            out.append("<time class=\"stamp\" datetime=\"").append(attr(start.toInstant().toString()))
+                    .append("\" title=\"").append(attr(start + (end.equals(start) ? "" : " – " + end)))
+                    .append("\">").append(escape(label)).append("</time>");
+        } catch (DateTimeException ignored) {
+            // Invalid or out-of-range metadata must not invent a time or hide the message.
+        }
+    }
+
+
     /** Condenses a run of folded tool/context rows into one collapsed, keyed group. */
     private static void flushActivity(StringBuilder out, List<JSONObject> folded) {
         if (folded.isEmpty()) return;
         out.append("<details class=\"activity\" data-key=\"")
                 .append(attr("g:" + stableKey(folded.get(0)))).append("\"><summary>")
-                .append(escape(activityLabel(folded))).append("</summary>");
+                .append(escape(activityLabel(folded)));
+        long first = Long.MIN_VALUE, last = Long.MIN_VALUE;
+        for (JSONObject message : folded) {
+            long saved = timestamp(message);
+            if (saved == Long.MIN_VALUE) continue;
+            if (first == Long.MIN_VALUE) first = saved;
+            last = saved;
+        }
+        appendTimestamp(out, first, last);
+        out.append("</summary>");
         for (JSONObject message : folded) appendTurn(out, "act", kindOf(message), message);
         out.append("</details>");
     }
@@ -655,17 +738,60 @@ public final class TerminalView extends FrameLayout {
         jumpFab.setVisibility(visible ? VISIBLE : GONE);
     }
 
-    /** Lazily built CommonMark pipeline: one parser, one inert HTML renderer. */
+    /** Lazily built CommonMark (GFM tables) pipeline: one parser, one inert HTML renderer. */
     private static final class Markdown {
-        private static final Parser PARSER = Parser.builder().build();
+        /** Only id characters can become a badge; anything else keeps the plain fence. */
+        private static final Pattern LANGUAGE_RE = Pattern.compile("[A-Za-z0-9+#._-]{1,24}");
+        /** Exact prefix/suffix the renderer writes for a fenced block with an info string. */
+        private static final String FENCE_OPEN = "<pre><code class=\"language-";
+        private static final String FENCE_CLOSE = "</code></pre>";
+
+        private static final List<Extension> EXTENSIONS =
+                Collections.singletonList(TablesExtension.create());
+        private static final Parser PARSER = Parser.builder().extensions(EXTENSIONS).build();
         private static final HtmlRenderer RENDERER = HtmlRenderer.builder()
+                .extensions(EXTENSIONS)
                 .escapeHtml(true)    // raw HTML in a message stays literal text, never markup
                 .sanitizeUrls(true)  // javascript:/file: URLs blanked; http(s)/mailto/data survive
                 .softbreak("<br />") // keep the author's line breaks inside a paragraph
                 .build();
 
         static String toHtml(String text) {
-            return RENDERER.render(PARSER.parse(text));
+            return badgeFencedCode(RENDERER.render(PARSER.parse(text)));
+        }
+
+        /**
+         * Frames each language-tagged fenced block as
+         * {@code <div class="code"><span class="lang">java</span><pre><code …>}. No regex
+         * over user text: {@code escapeHtml(true)} turns every '&lt;' in code content into
+         * {@code &lt;}, so this exact prefix can only come from the renderer's own
+         * fenced-code output. A fence without an info string keeps the plain frame.
+         */
+        static String badgeFencedCode(String html) {
+            if (html.indexOf(FENCE_OPEN) < 0) return html;
+            StringBuilder out = new StringBuilder(html.length() + 64);
+            int cursor = 0;
+            while (true) {
+                int fence = html.indexOf(FENCE_OPEN, cursor);
+                if (fence < 0) {
+                    out.append(html, cursor, html.length());
+                    break;
+                }
+                int start = fence + FENCE_OPEN.length();
+                int quote = html.indexOf('"', start);
+                int close = quote < 0 ? -1 : html.indexOf(FENCE_CLOSE, quote);
+                if (quote < 0 || close < 0 || !LANGUAGE_RE.matcher(html.substring(start, quote)).matches()) {
+                    out.append(html, cursor, html.length());
+                    break;
+                }
+                int end = close + FENCE_CLOSE.length();
+                out.append(html, cursor, fence)
+                        .append("<div class=\"code\"><span class=\"lang\">")
+                        .append(html, start, quote).append("</span>")
+                        .append(html, fence, end).append("</div>");
+                cursor = end;
+            }
+            return out.toString();
         }
     }
 

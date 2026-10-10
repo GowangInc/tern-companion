@@ -8,13 +8,26 @@ computer. Originals are written once under a generated id (never the client's
 filename, never a caller-supplied path) with owner-only permissions, and a
 partial write never becomes a usable id.
 
-`reference` renders the exact native OMP `@file` mention the bridge appends to
-the submitted prompt; `enrich_conversation` maps those mention lines back to the
+`reference` renders the exact native OMP mention the bridge appends to the
+submitted prompt; `enrich_conversation` maps those mention lines back to the
 metadata the phone renders while leaving every other user line — including
 code and markup — untouched. Nothing here decodes or embeds file contents.
+
+`stage_media`/`stage_media_bytes` let conversation.py stage raster images the
+canonical active branch actually references (image payloads, blob refs and
+local Markdown image links) into the same owner-only store, under a stable
+content-derived id so the 2-second capture refresh never recopies or churns
+ids. Only PNG/JPEG/WebP/GIF magic bytes are accepted; the claimed mime and
+display name are never trusted for typing. Staged media sidecars carry
+"kind": "media" and are served by metadata()/original() only while listed in
+the session's `.visible-media.json` manifest, which read_conversation
+republishes from the active branch on every capture — media referenced only
+by hidden or abandoned-branch records is never retrievable. Uploads (no
+"kind") are unaffected by the manifest.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import mimetypes
 import os
@@ -24,18 +37,21 @@ import time
 from pathlib import Path
 
 __all__ = ["UPLOAD_ROOT", "MAX_UPLOAD_BYTES", "MAX_ATTACHMENTS", "ID_PATTERN",
-           "session_dir", "reference", "store", "metadata", "original",
-           "reference_index", "enrich_conversation"]
+           "MEDIA_MIMES", "session_dir", "reference", "store", "metadata",
+           "original", "reference_index", "enrich_conversation",
+           "is_stored_upload", "stage_media", "stage_media_bytes", "publish_media"]
 
 UPLOAD_ROOT = Path.home() / ".tern" / "uploads"
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_ATTACHMENTS = 8
+MEDIA_MIMES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
 ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 SESSION_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 MIME_PATTERN = re.compile(r"[A-Za-z0-9!#$&^_.+-]{1,127}/[A-Za-z0-9!#$&^_.+-]{1,127}\Z")
 EXTENSION_PATTERN = re.compile(r"\.[a-z0-9]{1,8}\Z")
 NAME_LIMIT = 255
 SIDECAR_SUFFIX = ".meta.json"
+VISIBLE_MANIFEST = ".visible-media.json"
 WIRE_FIELDS = ("id", "name", "mime", "size")
 READ_CHUNK = 64 * 1024
 
@@ -119,8 +135,8 @@ def _write_body(stream, partial: Path, length: int) -> None:
 
 def _write_sidecar(sidecar: Path, record: dict) -> None:
     """Persist one upload's metadata, atomically and owner-only."""
-    partial = sidecar.with_name(sidecar.name + ".part")
-    with open(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w",
+    partial = sidecar.with_name(sidecar.name + "." + secrets.token_hex(16) + ".part")
+    with open(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w",
               encoding="utf-8") as out:
         json.dump(record, out, ensure_ascii=False)
         out.flush()
@@ -185,16 +201,197 @@ def _wire(record: dict) -> dict:
     return {field: record[field] for field in WIRE_FIELDS}
 
 
+def _raster_mime(data: bytes) -> str | None:
+    """The magic-byte raster type of a bounded buffer, or None."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _media_name(name) -> str:
+    """Display name for staged media; falls back to "image" instead of raising."""
+    if isinstance(name, str) and name:
+        candidate = name.replace("\\", "/").rsplit("/", 1)[-1]
+        try:
+            return _display_name(candidate)
+        except ValueError:
+            pass
+    return "image"
+
+
+def _write_bytes(data: bytes, partial: Path) -> None:
+    """Write a fresh partial file with staged media bytes, owner-only."""
+    with open(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as out:
+        out.write(data)
+        out.flush()
+        os.fsync(out.fileno())
+
+
+def _stage_bytes(session: str, data: bytes, name, mime) -> dict | None:
+    """Type, address and store bounded raster bytes under a stable content id."""
+    try:
+        if not 0 < len(data) <= MAX_UPLOAD_BYTES:
+            return None
+        content_type = _raster_mime(data)
+        if content_type is None:
+            return None
+        media_id = hashlib.sha256(data).hexdigest()[:32]
+        existing = _record(session, media_id)
+        if existing is not None:
+            return _wire(existing)
+        directory = session_dir(session)
+        stored = directory / (media_id + _extension(content_type))
+        partial = directory / ("." + media_id + "." + secrets.token_hex(16) + ".part")
+        try:
+            _write_bytes(data, partial)
+            os.replace(partial, stored)
+        finally:
+            try:
+                partial.unlink()
+            except OSError:
+                pass
+        record = {"id": media_id, "name": _media_name(name),
+                  "mime": content_type, "size": len(data)}
+        _write_sidecar(_sidecar(directory, media_id),
+                       {**record, "created": time.time(), "file": stored.name, "kind": "media"})
+        return record
+    except (OSError, ValueError):
+        return None
+
+
+def stage_media(session: str, source, *, name=None, mime=None) -> dict | None:
+    """Stage one referenced raster file into the session store, or None.
+
+    `source` must be a path a canonical visible record actually referenced.
+    A source that already is one of this session's stored originals returns
+    that record's existing wire metadata, so a phone upload never gains a
+    duplicate preview. Never raises: ineligible input is simply not staged.
+    """
+    try:
+        directory = _session_path(session)
+    except ValueError:
+        return None
+    try:
+        resolved = Path(source).resolve(strict=True)
+    except (OSError, TypeError, ValueError):
+        return None
+    if not resolved.is_file():
+        return None
+    for sidecar in sorted(directory.glob("*" + SIDECAR_SUFFIX)):
+        record = _record(session, sidecar.name[: -len(SIDECAR_SUFFIX)])
+        if record is None:
+            continue
+        try:
+            if (directory / record["file"]).resolve() == resolved:
+                return _wire(record)
+        except OSError:
+            continue
+    try:
+        size = resolved.stat().st_size
+        if not 0 < size <= MAX_UPLOAD_BYTES:
+            return None
+        data = resolved.read_bytes()
+    except OSError:
+        return None
+    display = name if isinstance(name, str) and name else resolved.name
+    return _stage_bytes(session, data, display, mime)
+
+
+def stage_media_bytes(session: str, data, *, name=None, mime=None) -> dict | None:
+    """Stage in-memory raster bytes (inline/base64 image payloads), or None."""
+    try:
+        _session_path(session)
+    except ValueError:
+        return None
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        return None
+    return _stage_bytes(session, bytes(data), name, mime)
+
+
+def publish_media(session: str, ids) -> None:
+    """Publish the media ids the latest active-branch capture references.
+
+    The manifest is rewritten only when the id set changed, so the capture
+    refresh never churns it. Never raises; a session with nothing staged keeps
+    no manifest at all.
+    """
+    try:
+        directory = _session_path(session)
+    except ValueError:
+        return
+    if not isinstance(ids, (list, tuple, set)):
+        return
+    valid = sorted({item for item in ids
+                    if isinstance(item, str) and ID_PATTERN.fullmatch(item)})
+    if not directory.is_dir():
+        return
+    manifest = directory / VISIBLE_MANIFEST
+    payload = json.dumps({"ids": valid}, ensure_ascii=False)
+    try:
+        if manifest.is_file() and manifest.read_text(encoding="utf-8") == payload:
+            return
+    except OSError:
+        return
+    try:
+        _write_sidecar(manifest, {"ids": valid})
+    except OSError:
+        pass
+
+
+def is_stored_upload(session, path) -> bool:
+    """True when this exact file is one of the session's stored uploads."""
+    try:
+        resolved = Path(path).resolve()
+        directory = _session_path(session)
+    except (OSError, TypeError, ValueError):
+        return False
+    for sidecar in sorted(directory.glob("*" + SIDECAR_SUFFIX)):
+        record = _record(session, sidecar.name[: -len(SIDECAR_SUFFIX)])
+        if record is None or record.get("kind") == "media":
+            continue
+        try:
+            if (directory / record["file"]).resolve() == resolved:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _visible_ids(session) -> set:
+    """The media ids the latest active-branch capture published, or an empty set."""
+    try:
+        data = json.loads((_session_path(session) / VISIBLE_MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    ids = data.get("ids") if isinstance(data, dict) else None
+    if not isinstance(ids, list):
+        return set()
+    return {item for item in ids if isinstance(item, str) and ID_PATTERN.fullmatch(item)}
+
+
+def _servable(session, record: dict) -> bool:
+    """Uploads are always served; staged media only while the active branch shows it."""
+    return record.get("kind") != "media" or record["id"] in _visible_ids(session)
+
+
 def metadata(session: str, upload_id: str) -> dict | None:
     """The stored wire metadata for one session-bound upload, or None."""
     record = _record(session, upload_id)
-    return None if record is None else _wire(record)
+    if record is None or not _servable(session, record):
+        return None
+    return _wire(record)
 
 
 def original(session: str, upload_id: str) -> Path | None:
     """The stored original bytes for one session-bound upload, or None."""
     record = _record(session, upload_id)
-    if record is None:
+    if record is None or not _servable(session, record):
         return None
     try:
         path = _session_path(session) / record["file"]
@@ -250,5 +447,19 @@ def enrich_conversation(payload: dict) -> dict:
         if not attached:
             continue
         message["text"] = "\n".join(kept)
-        message["attachments"] = attached
+        # read_conversation may already have attached staged media; merge by id.
+        merged: list[dict] = []
+        merged_ids: set[str] = set()
+        prior = message.get("attachments")
+        if isinstance(prior, list):
+            for item in prior:
+                if isinstance(item, dict) and isinstance(item.get("id"), str) \
+                        and item["id"] not in merged_ids:
+                    merged_ids.add(item["id"])
+                    merged.append(item)
+        for record in attached:
+            if record["id"] not in merged_ids:
+                merged_ids.add(record["id"])
+                merged.append(record)
+        message["attachments"] = merged
     return payload

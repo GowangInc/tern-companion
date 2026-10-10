@@ -104,7 +104,12 @@ public final class AndroidCheck {
         JSONArray messages = new JSONArray();
         messages.put(new JSONObject().put("role", "user").put("format", "markdown")
                 .put("text", "# Heading\n\n<body onload=x>raw</body>\n<files>a/b.txt</files>\n\n"
-                        + "```java\nint a = 1;\n```\n"));
+                        + "```java\nint a = 1;\n```\n\n"
+                        + "```\nplain <b>bytes</b>\n```\n\n"
+                        + "| Name | Note |\n| --- | --- |\n| a | <b>x</b> |\n| b | `code` |\n"
+                        + "| c | [ok](https://example.com/t) |\n| d | [bad](file:///etc/passwd) |\n\n"
+                        + "> quoted **strong**\n\n"
+                        + "1. first\n2. second\n"));
         messages.put(new JSONObject().put("role", "assistant").put("format", "markdown")
                 .put("text", "Use **bold**, `code`, [bad](javascript:alert(1)) and "
                         + "[ok](https://example.com/x)\n\n![diagram](https://example.com/p.png)\n"));
@@ -153,6 +158,31 @@ public final class AndroidCheck {
         }
         if (html.contains("# Heading")) throw new AssertionError("Markdown left as source text");
 
+        // GFM table: real structure, escaped cells, sanitized links, no raw pipe source left.
+        for (String required : new String[] {"<table>", "<thead>", "<tbody>", "</tbody>",
+                "<th>Name</th>", "<th>Note</th>", "<td>a</td>", "<td>b</td>",
+                "&lt;b&gt;x&lt;/b&gt;", "href=\"https://example.com/t\">ok</a>"}) {
+            if (!html.contains(required)) throw new AssertionError("Markdown table missing " + required);
+        }
+        if (html.contains("| Name |") || html.contains("| --- |"))
+            throw new AssertionError("Markdown table left as source text");
+        if (!java.util.regex.Pattern.compile("(?s)<tbody>.*<tr>.*<td>a</td>.*</tr>")
+                .matcher(html).find())
+            throw new AssertionError("Table cell is not inside a body row");
+
+        // Fenced code: a labelled frame only where an info string was supplied.
+        for (String required : new String[] {"<div class=\"code\">", "<span class=\"lang\">java</span>",
+                "<pre><code class=\"language-java\">int a = 1;", "int a = 1;\n</code></pre></div>"}) {
+            if (!html.contains(required))
+                throw new AssertionError("Fenced code lost its language frame: " + required);
+        }
+        if (!html.contains("<pre><code>plain &lt;b&gt;bytes&lt;/b&gt;\n</code></pre>"))
+            throw new AssertionError("Untagged fenced block gained a frame or lost escaping");
+        if (html.split("class=\"lang\"", -1).length - 1 != 1)
+            throw new AssertionError("A fence without an info string gained a language badge");
+        if (html.contains("file:") || html.contains("javascript:"))
+            throw new AssertionError("A markdown link escaped URL sanitization");
+
         java.util.regex.Matcher groups = java.util.regex.Pattern
                 .compile("<details class=\"activity\" data-key=\"([^\"]*)\">").matcher(html);
         int found = 0;
@@ -191,7 +221,8 @@ public final class AndroidCheck {
 
         java.util.Set<String> allowed = new java.util.HashSet<>(java.util.Arrays.asList(
                 "msg", "user", "assistant", "tool", "context", "other", "who", "name", "body", "plain",
-                "activity", "act", "attach", "attach-img", "attach-file", "attach-name", "attach-meta"));
+                "activity", "act", "attach", "attach-img", "attach-file", "attach-name", "attach-meta",
+                "code", "lang", "stamp"));
         java.util.regex.Matcher classes =
                 java.util.regex.Pattern.compile("class=\"([^\"]*)\"").matcher(html);
         while (classes.find()) {
@@ -200,6 +231,27 @@ public final class AndroidCheck {
                         || token.matches("language-[A-Za-z0-9+#._-]+")) continue;
                 throw new AssertionError("Payload text reached a class attribute: " + token);
             }
+        }
+        java.util.TimeZone originalZone = java.util.TimeZone.getDefault();
+        try {
+            java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("Asia/Shanghai"));
+            JSONArray timed = new JSONArray()
+                    .put(new JSONObject().put("role", "user").put("text", "user")
+                            .put("timestamp", 1791678610000L))
+                    .put(new JSONObject().put("role", "tool").put("text", "first step")
+                            .put("timestamp", 1791678611000L))
+                    .put(new JSONObject().put("role", "tool").put("text", "last step")
+                            .put("timestamp", 1791678619000L))
+                    .put(new JSONObject().put("role", "assistant").put("text", "legacy reply")
+                            .put("timestamp", "<script>invalid</script>"));
+            String dated = (String) render.invoke(null, new JSONObject().put("messages", timed));
+            if (!dated.contains("08:30:10</time>") || !dated.contains("08:30:11–08:30:19</time>"))
+                throw new AssertionError("Message/activity timestamps did not use phone-local time");
+            if (!dated.contains("datetime=\"2026-10-11T00:30:10Z\"")
+                    || dated.contains("<script>invalid") || !dated.contains("legacy reply"))
+                throw new AssertionError("Timestamp metadata was invented, unsafe, or hid a legacy message");
+        } finally {
+            java.util.TimeZone.setDefault(originalZone);
         }
         System.out.println("Conversation role, markup and attachment-safety checks passed.");
     }

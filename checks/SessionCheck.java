@@ -5,12 +5,15 @@ import org.json.JSONObject;
 import org.json.JSONException;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Trust-boundary checks for {@link SessionGroups} against synthetic {@code tern ls --json}
- * payloads: grouping, live-block filtering, ordering, focus labels, and the conservative
- * Flow/background classification.
+ * payloads: grouping, live-block filtering, ordering, focus labels, the conservative
+ * Flow/background classification, and the phone-only hidden session/agent filter.
  *
  * Run on the JVM with org.json on the classpath together with the app sources, or on device
  * with app_process and the built APK on CLASSPATH (as checks/QrCheck.java does).
@@ -22,6 +25,7 @@ public final class SessionCheck {
         grouping();
         malformed();
         flags();
+        hidden();
         System.out.println("Session grouping checks passed.");
     }
 
@@ -132,6 +136,84 @@ public final class SessionCheck {
         check(SessionGroups.isBackground(new JSONObject().put("name", "plain").put("background", true)), "background flag");
         check(!SessionGroups.isBackground(new JSONObject().put("name", "workflow")), "plain project stays visible");
         check(!SessionGroups.isBackground(null), "null session");
+    }
+
+    /**
+     * Phone-only hiding: one agent, one whole session, per-PC keys, and nothing
+     * else moves. Hiding is a pure view filter — the payload is never rewritten.
+     */
+    private static void hidden() throws JSONException {
+        JSONArray defaultTabs = tabs(tab(null,
+                live(11, "Build", "/bin/zsh", "/srv/alpha", false),
+                live(12, null, "/bin/zsh", "/srv/alpha", true),
+                live(13, "Tests", "/bin/zsh", "/srv/alpha", false)));
+
+        JSONArray sessions = new JSONArray();
+        sessions.put(new JSONObject().put("id", "sess-default").put("name", "Default").put("tabs", defaultTabs));
+        sessions.put(session("Other", tabs(tab(null, live(21, "Server", "/usr/bin/python3", "/srv/other", false)))));
+        sessions.put(session("Flow - deploy", tabs(tab(null, live(31, "Deploy", "/bin/sh", "/srv/deploy", false)))));
+        sessions.put(new JSONObject().put("name", "null-id").put("id", JSONObject.NULL)
+                .put("tabs", tabs(tab(null, live(41, "Shell", "/bin/sh", "/srv/x", false)))));
+
+        List<SessionGroups.Group> groups = SessionGroups.group(sessions);
+        check(groups.size() == 4, "hidden fixture sessions: " + groups.size());
+        SessionGroups.Group def = groups.get(0);
+        check(def.id.equals("sess-default"), "session id used when present");
+        check(groups.get(1).id.equals("Other"), "session name is the id fallback");
+        check(groups.get(3).id.equals("null-id"), "JSON null id falls back to the name");
+        check(def.hiddenBlocks == 0 && SessionGroups.normal(groups).size() == 3, "nothing hidden until asked");
+
+        Set<String> hiddenBlocks = new HashSet<>();
+        hiddenBlocks.add(SessionGroups.blockKey(def.id, "12"));
+        List<SessionGroups.Group> oneHidden = SessionGroups.visible(groups, false, Collections.emptySet(), hiddenBlocks);
+        check(oneHidden.size() == 3, "hiding one agent removes no session: " + oneHidden.size());
+        SessionGroups.Group scoped = oneHidden.get(0);
+        check(scoped.liveCount() == 2 && scoped.hiddenBlocks == 1, "only the hidden agent is dropped");
+        check(ids(scoped.blocks).equals("[11, 13]"), "sibling agents stay: " + ids(scoped.blocks));
+        check(scoped.current().blockId.equals("11") && scoped.currentLabel().equals("Build"),
+                "current falls back to the first visible agent");
+        check(def.liveCount() == 3 && def.hiddenBlocks == 0, "filtering never mutates its input");
+
+        Set<String> hiddenSessions = new HashSet<>();
+        hiddenSessions.add("Other");
+        List<SessionGroups.Group> withoutOther = SessionGroups.visible(groups, false, hiddenSessions, hiddenBlocks);
+        check(withoutOther.size() == 2 && !contains(withoutOther, "Other"), "a hidden session leaves whole");
+        check(contains(withoutOther, "Default"), "hiding a sibling session leaves Default");
+
+        Set<String> everyBlock = new HashSet<>();
+        everyBlock.add(SessionGroups.blockKey(def.id, "11"));
+        everyBlock.add(SessionGroups.blockKey(def.id, "12"));
+        everyBlock.add(SessionGroups.blockKey(def.id, "13"));
+        SessionGroups.Group emptied = SessionGroups.visible(groups, false, Collections.emptySet(), everyBlock).get(0);
+        check(emptied.liveCount() == 0 && emptied.hiddenBlocks == 3, "all agents hidden keeps the session for restore");
+        check(emptied.current() == null && emptied.currentLabel().equals("Default"), "all hidden: the session name is the label");
+        check(SessionGroups.visible(groups, false, hiddenSessions, everyBlock).size() == 2,
+                "session and agent hides apply together");
+
+        List<SessionGroups.Group> background = SessionGroups.visible(groups, true, Collections.emptySet(), Collections.emptySet());
+        check(background.size() == 1 && background.get(0).name.equals("Flow - deploy"), "background filter still works");
+        Set<String> hiddenFlow = new HashSet<>();
+        hiddenFlow.add("Flow - deploy");
+        check(SessionGroups.visible(groups, true, hiddenFlow, Collections.emptySet()).isEmpty(),
+                "a hidden background session drops out of its own list");
+
+        check(SessionGroups.visible(null, false, null, null).isEmpty(), "null payload");
+        check(SessionGroups.visible(groups, false, null, null).size() == 3, "null hidden sets are tolerated");
+        check(SessionGroups.normal(groups).size()
+                == SessionGroups.visible(groups, false, Collections.emptySet(), Collections.emptySet()).size(),
+                "normal() is visible() with nothing hidden");
+
+        check(SessionGroups.blockKey(def.id, "12").equals("sess-default/12"), "block key is session-scoped and stable");
+        check(!SessionGroups.blockKey(def.id, "12").equals(SessionGroups.blockKey("Other", "12")),
+                "the same block id in two sessions stays distinct");
+        check(SessionGroups.hiddenSessionsKey("https://pc-a:9260").equals(SessionGroups.hiddenSessionsKey("https://pc-a:9260")),
+                "one PC keeps one hidden session set");
+        check(!SessionGroups.hiddenSessionsKey("https://pc-a:9260").equals(SessionGroups.hiddenSessionsKey("https://pc-b:9260")),
+                "hidden sessions never leak between saved PCs");
+        check(!SessionGroups.hiddenBlocksKey("https://pc-a:9260").equals(SessionGroups.hiddenSessionsKey("https://pc-a:9260")),
+                "hidden sessions and hidden agents use separate keys");
+        check(!SessionGroups.hiddenBlocksKey("https://pc-a:9260").equals(SessionGroups.hiddenBlocksKey("https://pc-b:9260")),
+                "hidden agents never leak between saved PCs");
     }
 
     private static JSONObject live(long id, String title, String program, String cwd, boolean focused) throws JSONException {

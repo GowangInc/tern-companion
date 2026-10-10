@@ -533,6 +533,17 @@ class PromptAcceptanceChecks(unittest.TestCase):
             path.write_bytes(prior + accepted)
             self.assertTrue(bridge.accepted_prompt(path, offset, prompt))
 
+    def test_native_trim_is_acknowledged_without_ignoring_internal_whitespace(self):
+        expected = "first line\n  indented café\nlast line"
+        for content in (expected, [{"type": "text", "text": expected}]):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "session.jsonl"
+                row = {"type": "message", "message": {"role": "user", "content": content}}
+                path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+                self.assertTrue(bridge.accepted_prompt(path, 0, "\ufeff \n" + expected + "\n\u3000"))
+                self.assertFalse(bridge.accepted_prompt(path, 0, expected.replace("  indented", "indented")))
+                self.assertFalse(bridge.accepted_prompt(path, path.stat().st_size, " \n" + expected + "\n "))
+
     def test_identical_concurrent_send_needs_its_own_persisted_message(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session.jsonl"
