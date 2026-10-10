@@ -7,6 +7,7 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.net.Uri;
 import android.os.Build;
 import android.util.AttributeSet;
 import android.view.Gravity;
@@ -27,8 +28,11 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -41,10 +45,24 @@ import java.util.regex.Pattern;
  * the DOM; no navigation, no network, no bridges. Older bridges that still
  * answer with plain text are shown escaped through the same pane.
  *
- * Conversation captures are rendered locally as role-separated cards: roles come
- * from a fixed set, every label and text is escaped, and CommonMark markdown is
- * rendered with raw HTML escaped and URLs sanitized (tool/context parts stay
- * folded in a details block).
+ * Conversation captures are rendered locally as readable chat: system prose type
+ * for You/Assistant turns (user bubbles right-aligned on muted sage, assistant
+ * text on the open page), and consecutive tool/context rows condensed into one
+ * collapsed Activity group that keeps every character for expansion. Roles come
+ * from a fixed set, every label/name/text is escaped, CommonMark markdown is
+ * rendered with raw HTML escaped and URLs sanitized, and the reader's expansion
+ * state survives live refresh through id-derived (never offset-derived) keys.
+ *
+ * Attachments are drawn from untrusted JSON: only a lowercase 32-hex id with a
+ * raster image mime becomes an inline `https://attachments.tern.invalid/<id>`
+ * image, everything else becomes a name/type/size card, and a non-conforming id
+ * renders nothing. The pane's own request interceptor is the only consumer of
+ * that host and calls the host-supplied AttachmentLoader for ids it just
+ * rendered; every other http/https/file/content fetch stays blocked and the CSP
+ * still forbids external images, scripts, frames and any other network.
+ *
+ * Terminal captures keep a separate compact monospace layout so a raw screen is
+ * never dressed up as conversation.
  *
  * Updates replace the DOM in place (never reload the page). The reader's
  * scroll position is preserved while browsing history; new output only pulls
@@ -72,14 +90,25 @@ public final class TerminalView extends FrameLayout {
 
     /** Root class that lifts the pane out of terminal whitespace into chat prose. */
     private static final String CONVO_CLASS = "convo";
+    /** Root class for a raw screen capture: compact monospace, never chat chrome. */
+    private static final String TERM_CLASS = "term";
     private static final Set<String> CONVO_ROLES =
             new HashSet<>(Arrays.asList("user", "assistant", "tool", "context"));
 
+    /** The one origin the pane's images may come from; hardcoded, never from payload. */
+    static final String ATTACHMENT_HOST = "attachments.tern.invalid";
+    private static final Pattern ATTACHMENT_PATH = Pattern.compile("^/([0-9a-f]{32})$");
+    private static final Pattern ATTACHMENT_ID = Pattern.compile("^[0-9a-f]{32}$");
+    private static final Pattern SAFE_MIME = Pattern.compile(
+            "[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}");
+    private static final Set<String> RASTER_MIME = new HashSet<>(Arrays.asList(
+            "image/png", "image/jpeg", "image/webp", "image/gif"));
+
     private static final String SHELL_HEAD = "<!doctype html><html><head><meta charset=\"utf-8\">"
             + "<meta http-equiv=\"Content-Security-Policy\" content=\""
-            + "default-src 'none'; img-src 'none'; font-src 'none'; connect-src 'none';"
-            + " media-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'none';"
-            + " base-uri 'none'; form-action 'none';"
+            + "default-src 'none'; img-src https://" + ATTACHMENT_HOST + "; font-src 'none';"
+            + " connect-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none';"
+            + " worker-src 'none'; base-uri 'none'; form-action 'none';"
             + " style-src 'unsafe-inline'; script-src 'unsafe-inline'\">"
             + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0,"
             + " maximum-scale=10.0, user-scalable=yes\">"
@@ -88,28 +117,32 @@ public final class TerminalView extends FrameLayout {
             + "white-space:pre-wrap;overflow-wrap:anywhere;color:" + INK + ";}"
             + "#t pre{font:inherit;margin:0;padding:0;}"
             + "::selection{background:#d5e2d5;color:" + INK + ";}"
-            // Conversation cards: prose whitespace, quiet role separation, no extra frames.
-            + "#t.convo{font-family:system-ui,sans-serif;white-space:normal;"
-            + "overflow-wrap:break-word;line-height:1.55;font-size:16px;}"
-            + "#t.convo .msg{margin:0 0 10px;padding:6px 10px;border-radius:8px;"
-            + "border-left:3px solid #c9d3cc;background:#faf8f2;}"
-            + "#t.convo .who{font-size:0.78em;font-weight:bold;letter-spacing:0.06em;"
-            + "text-transform:uppercase;color:#5d6b64;}"
-            + "#t.convo .name{font-weight:normal;letter-spacing:0;text-transform:none;"
-            + "margin-left:8px;color:#806022;overflow-wrap:anywhere;}"
-            + "#t.convo .user{border-left-color:#17634e;background:#f1f5f0;}"
-            + "#t.convo .assistant{border-left-color:#365e7a;background:#f3f5f7;}"
-            + "#t.convo .tool,#t.convo .context,#t.convo .other{border-left-color:#c2bcae;"
-            + "background:#f6f4ed;}"
-            + "#t.convo details{margin:0;}"
-            + "#t.convo summary{cursor:pointer;color:#5d6b64;font-size:0.78em;min-height:48px;"
-            + "font-weight:bold;letter-spacing:0.06em;text-transform:uppercase;}"
+            // Terminal captures: compact monospace dump, deliberately not chat chrome.
+            + "#t.term{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"
+            + "font-size:0.95em;line-height:1.38;}"
+            // Conversation: prose first; frames only where they carry meaning.
+            + "#t.convo{font-family:-apple-system,system-ui,\"Segoe UI\",Roboto,sans-serif;"
+            + "white-space:normal;overflow-wrap:break-word;line-height:1.55;font-size:16px;}"
+            + "#t.convo .msg{margin:0 0 14px;}"
+            + "#t.convo .who{display:block;font-size:0.72em;font-weight:600;letter-spacing:0.07em;"
+            + "text-transform:uppercase;color:#6b7770;margin:0 0 4px;}"
+            + "#t.convo .name{font-weight:400;letter-spacing:0;text-transform:none;margin-left:6px;"
+            + "color:#8a6f33;overflow-wrap:anywhere;}"
+            + "#t.convo .msg.user{display:flex;flex-direction:column;align-items:flex-end;}"
+            + "#t.convo .user .who{text-align:right;}"
+            + "#t.convo .user .body{max-width:88%;background:#e6ece1;border-radius:14px 14px 4px 14px;"
+            + "padding:8px 12px;}"
+            + "#t.convo .assistant .body{max-width:100%;}"
+            + "#t.convo details.activity{margin:2px 0 14px;padding-left:10px;"
+            + "border-left:2px solid #d9d4c6;}"
+            + "#t.convo details.activity>summary{cursor:pointer;color:#5d6b64;font-size:0.76em;"
+            + "font-weight:600;letter-spacing:0.06em;text-transform:uppercase;padding:6px 0;"
+            + "min-height:32px;}"
             + "#t.convo summary:focus-visible{outline:2px solid #17634e;}"
-            + "#t.convo .body{margin-top:4px;}"
-            + "#t.convo .msg.tool .body,#t.convo .msg.context .body,#t.convo .msg.other .body"
-            + "{font-family:monospace;font-size:0.85em;white-space:pre-wrap;"
-            + "overflow-wrap:anywhere;max-height:14em;overflow:auto;background:#efece2;"
-            + "padding:6px 8px;border-radius:6px;}"
+            + "#t.convo .act{margin:6px 0 6px 8px;padding-left:8px;border-left:2px solid #e4dfd2;}"
+            + "#t.convo .act .body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"
+            + "font-size:0.82em;white-space:pre-wrap;overflow-wrap:anywhere;max-height:16em;"
+            + "overflow:auto;background:#efece2;padding:6px 8px;border-radius:6px;}"
             + "#t.convo h1,#t.convo h2,#t.convo h3,#t.convo h4,#t.convo h5,#t.convo h6"
             + "{margin:0.7em 0 0.3em;line-height:1.25;}"
             + "#t.convo h1{font-size:1.35em;}#t.convo h2{font-size:1.2em;}"
@@ -119,18 +152,26 @@ public final class TerminalView extends FrameLayout {
             + "#t.convo li{margin:0.15em 0;}"
             + "#t.convo blockquote{margin:0.45em 0;padding-left:0.8em;"
             + "border-left:2px solid #d8d2c4;color:#5d6b64;}"
-            + "#t.convo .plain{white-space:pre-wrap;overflow-wrap:anywhere;}"
-            + "#t.convo code{font-family:monospace;font-size:0.92em;background:#efece2;"
-            + "border-radius:3px;padding:0 3px;}"
-            + "#t.convo pre{font-family:monospace;font-size:0.85em;line-height:1.45;"
-            + "white-space:pre;overflow-x:auto;background:#efece2;padding:6px 8px;"
-            + "border-radius:6px;}"
-            + "#t.convo pre code{background:none;padding:0;font-size:1em;}"
             + "#t.convo hr{border:0;border-top:1px solid #d8d2c4;margin:0.7em 0;}"
-            + "#t.convo table{border-collapse:collapse;font-size:0.9em;}"
+            + "#t.convo table{display:block;overflow-x:auto;border-collapse:collapse;font-size:0.9em;}"
             + "#t.convo th,#t.convo td{border:1px solid #d8d2c4;padding:2px 6px;}"
             + "#t.convo a{color:#365e7a;}"
-            + "#t.convo img{max-width:100%;height:auto;}"
+            + "#t.convo .plain{white-space:pre-wrap;overflow-wrap:anywhere;}"
+            + "#t.convo code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"
+            + "font-size:0.9em;background:#efece2;border-radius:3px;padding:0 3px;}"
+            // Fenced code scrolls sideways; the pane never becomes one raw dump.
+            + "#t.convo pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"
+            + "font-size:0.84em;line-height:1.45;white-space:pre;overflow-x:auto;"
+            + "-webkit-overflow-scrolling:touch;background:#efece2;padding:6px 8px;border-radius:6px;}"
+            + "#t.convo pre code{background:none;padding:0;font-size:1em;}"
+            + "#t.convo .attach{margin-top:6px;max-width:100%;min-width:0;}"
+            + "#t.convo .attach-img{display:block;max-width:100%;max-height:22em;width:auto;"
+            + "height:auto;border-radius:8px;background:#e9e5db;}"
+            + "#t.convo .attach-file{display:inline-flex;flex-direction:column;gap:2px;"
+            + "background:#efece2;border:1px solid #ded8ca;border-radius:8px;padding:6px 10px;"
+            + "max-width:100%;}"
+            + "#t.convo .attach-name{font-weight:600;overflow-wrap:anywhere;}"
+            + "#t.convo .attach-meta{font-size:0.82em;color:#6b7770;}"
             + "</style></head><body>";
     private static final String SHELL_SCRIPT =
             "<script>function tSet(h){const t=document.getElementById('t');"
@@ -142,11 +183,24 @@ public final class TerminalView extends FrameLayout {
         void onTailChange(boolean atTail);
     }
 
+    /**
+     * Supplies the bytes behind one attachment id this pane has just rendered.
+     * The host owns authentication and session binding; returning null hides the
+     * image. Called from the WebView's request thread, only for ids that passed
+     * the pane's own host/path/id checks.
+     */
+    public interface AttachmentLoader {
+        WebResourceResponse load(String id);
+    }
+
     private final WebView webView;
     private final Button jumpFab;
     private final float density;
     private final float fontScale;
     private OnTailChangeListener tailListener;
+    private AttachmentLoader attachmentLoader;
+    /** Ids rendered as images by the newest conversation; the loader gate for {@link #ATTACHMENT_HOST}. */
+    private volatile Set<String> renderedAttachmentIds = Collections.emptySet();
     private boolean loaded;
     private String lastFragment = "";
     private String lastClass = "";
@@ -184,7 +238,7 @@ public final class TerminalView extends FrameLayout {
         pill.setColor(0xff17634e);
         jumpFab.setBackground(new RippleDrawable(ColorStateList.valueOf(0x33ffffff), pill, null));
         jumpFab.setVisibility(GONE);
-        jumpFab.setContentDescription("Jump to the latest terminal output");
+        jumpFab.setContentDescription("Jump to the latest output");
         jumpFab.setOnClickListener(v -> scrollToTail());
         FrameLayout.LayoutParams fab = new FrameLayout.LayoutParams(-2, dp(48),
                 Gravity.BOTTOM | Gravity.END);
@@ -217,11 +271,24 @@ public final class TerminalView extends FrameLayout {
             }
 
             @Override public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                String scheme = request.getUrl().getScheme();
+                Uri url = request.getUrl();
+                String scheme = url.getScheme();
+                if ("https".equals(scheme) && ATTACHMENT_HOST.equals(url.getHost())) {
+                    // Only ids this pane just rendered as images may reach the loader.
+                    AttachmentLoader loader = attachmentLoader;
+                    String path = url.getPath();
+                    if (loader != null && path != null) {
+                        Matcher attachment = ATTACHMENT_PATH.matcher(path);
+                        if (attachment.matches() && renderedAttachmentIds.contains(attachment.group(1))) {
+                            WebResourceResponse response = loader.load(attachment.group(1));
+                            if (response != null) return response;
+                        }
+                    }
+                    return blocked();
+                }
                 if ("http".equals(scheme) || "https".equals(scheme)
                         || "file".equals(scheme) || "content".equals(scheme)) {
-                    return new WebResourceResponse("text/plain", "utf-8",
-                            new ByteArrayInputStream(new byte[0]));
+                    return blocked(); // every ordinary fetch stays inert.
                 }
                 return null;
             }
@@ -244,12 +311,19 @@ public final class TerminalView extends FrameLayout {
 
     /** Injects a bridge HTML capture after whitelist sanitization. Safe to call repeatedly. */
     public void loadCapture(@NonNull String html) {
-        loadFragment(sanitize(html), "");
+        renderedAttachmentIds = Collections.emptySet(); // terminal bytes never carry attachments
+        loadFragment(sanitize(html), TERM_CLASS);
     }
 
-    /** Injects a bridge conversation payload (quiet role-separated cards). */
+    /** Injects a bridge conversation payload (readable chat + attachment previews). */
     public void loadConversation(@NonNull JSONObject payload) {
+        renderedAttachmentIds = collectAttachmentIds(payload);
         loadFragment(conversationHtml(payload), CONVO_CLASS);
+    }
+
+    /** Authenticated byte source for the attachment images this pane renders. */
+    public void setAttachmentLoader(AttachmentLoader loader) {
+        attachmentLoader = loader;
     }
 
     /** Lets a paged conversation return to the live page instead of its local tail. */
@@ -258,44 +332,190 @@ public final class TerminalView extends FrameLayout {
     }
 
     /**
-     * Renders a conversation payload into card HTML. Nothing from the payload is
-     * interpolated as markup, as a class name, or as a fetchable URL: role classes
-     * come from a fixed set, every label/name/text is escaped, and the markdown
-     * renderer escapes raw HTML and sanitizes link/image URLs.
+     * Renders a conversation payload into readable chat HTML. Nothing from the
+     * payload is interpolated as markup, as a class name, or as a fetchable URL:
+     * role classes come from a fixed set, every label/name/text is escaped, the
+     * markdown renderer escapes raw HTML and sanitizes link/image URLs, and only
+     * ids that pass a strict 32-hex check can become an image under the pane's own
+     * attachment origin. Detail keys come from message ids rather than the page
+     * offset, so live refreshes keep the reader's expansion state.
      */
     static String conversationHtml(JSONObject payload) {
         JSONArray messages = payload == null ? null : payload.optJSONArray("messages");
         if (messages == null || messages.length() == 0) {
-            return "<div class=\"msg context\"><span class=\"who\">Session</span>"
+            return "<div class=\"msg context\"><div class=\"who\">Session</div>"
                     + "<div class=\"body\">No messages captured for this session.</div></div>";
         }
         StringBuilder out = new StringBuilder();
-        int start = payload.optInt("start");
+        List<JSONObject> folded = new ArrayList<>();
         for (int i = 0; i < messages.length(); i++) {
             JSONObject message = messages.optJSONObject(i);
-            if (message == null) continue;
-            String role = message.optString("role", "");
+            if (message == null || !renderable(message)) continue;
+            String kind = kindOf(message);
+            if (!"user".equals(kind) && !"assistant".equals(kind)) {
+                folded.add(message); // consecutive tool/context rows become one Activity group
+                continue;
+            }
+            flushActivity(out, folded);
+            folded.clear();
+            appendTurn(out, "msg", kind, message);
+        }
+        flushActivity(out, folded);
+        return out.toString();
+    }
+
+    /** Fixed role class: known roles pass through, anything else is an inert `other`. */
+    private static String kindOf(JSONObject message) {
+        String role = message.optString("role", "");
+        return CONVO_ROLES.contains(role) ? role : "other";
+    }
+
+    /** True when a message carries text or at least one addressable attachment. */
+    private static boolean renderable(JSONObject message) {
+        if (!message.optString("text", "").trim().isEmpty()) return true;
+        JSONArray attachments = message.optJSONArray("attachments");
+        if (attachments == null) return false;
+        for (int i = 0; i < attachments.length(); i++) {
+            JSONObject attachment = attachments.optJSONObject(i);
+            if (attachment != null && addressable(attachment)) return true;
+        }
+        return false;
+    }
+
+    /** One written turn (`msg`) or one row inside an Activity group (`act`). */
+    private static void appendTurn(StringBuilder out, String wrapper, String kind, JSONObject message) {
+        String text = message.optString("text", "");
+        out.append("<div class=\"").append(wrapper).append(' ').append(kind).append("\">")
+                .append("<div class=\"who\">")
+                .append(who(kind, message.optString("role", ""), message.optString("name", "").trim()))
+                .append("</div>");
+        // An image-only send arrives with empty text: no empty bubble, just the preview.
+        if (!text.trim().isEmpty()) {
+            out.append("<div class=\"body\">")
+                    .append(body(text, message.optString("format", "text"))).append("</div>");
+        }
+        appendAttachments(out, message);
+        out.append("</div>");
+    }
+
+    /** Condenses a run of folded tool/context rows into one collapsed, keyed group. */
+    private static void flushActivity(StringBuilder out, List<JSONObject> folded) {
+        if (folded.isEmpty()) return;
+        out.append("<details class=\"activity\" data-key=\"")
+                .append(attr("g:" + stableKey(folded.get(0)))).append("\"><summary>")
+                .append(escape(activityLabel(folded))).append("</summary>");
+        for (JSONObject message : folded) appendTurn(out, "act", kindOf(message), message);
+        out.append("</details>");
+    }
+
+    /** Summary wording: step count plus the first few tool names seen in the run. */
+    private static String activityLabel(List<JSONObject> folded) {
+        int count = folded.size();
+        StringBuilder label = new StringBuilder("Activity \u00b7 ").append(count)
+                .append(count == 1 ? " step" : " steps");
+        List<String> names = new ArrayList<>();
+        for (JSONObject message : folded) {
             String name = message.optString("name", "").trim();
-            String text = message.optString("text", "");
-            String kind = CONVO_ROLES.contains(role) ? role : "other";
-            boolean folded = !"user".equals(kind) && !"assistant".equals(kind);
-            out.append("<div class=\"msg ").append(kind).append("\">");
-            if (folded) {
-                // Tool/context parts keep every character but stay folded until tapped.
-                String key = escape(message.optString("id") + ":" + kind + ":" + (start + i))
-                        .replace("\"", "&quot;");
-                out.append("<details data-key=\"").append(key).append("\"><summary><span class=\"who\">")
-                        .append(who(kind, role, name))
-                        .append("</span></summary><pre class=\"body\">").append(escape(text))
-                        .append("</pre></details>");
+            if (name.isEmpty()) continue;
+            if (name.length() > 40) name = name.substring(0, 40) + "\u2026";
+            if (!names.contains(name)) names.add(name);
+        }
+        for (int i = 0; i < names.size() && i < 3; i++) {
+            label.append(i == 0 ? " \u00b7 " : ", ").append(names.get(i));
+        }
+        if (names.size() > 3) label.append("\u2026");
+        return label.toString();
+    }
+
+    /** Refresh-stable detail key: the message id, or a content hash when it has none. */
+    private static String stableKey(JSONObject message) {
+        String id = message.optString("id", "").trim();
+        if (!id.isEmpty()) return id;
+        String text = message.optString("role", "") + "\u0000" + message.optString("text", "");
+        long hash = 0xcbf29ce484222325L; // FNV-1a: deterministic and offset independent
+        for (int i = 0; i < text.length(); i++) {
+            hash = (hash ^ text.charAt(i)) * 0x100000001b3L;
+        }
+        return "h" + Long.toHexString(hash);
+    }
+
+    /** A rendered attachment: inline raster preview, or a readable name/type/size card. */
+    private static void appendAttachments(StringBuilder out, JSONObject message) {
+        JSONArray attachments = message.optJSONArray("attachments");
+        if (attachments == null) return;
+        for (int i = 0; i < attachments.length(); i++) {
+            JSONObject attachment = attachments.optJSONObject(i);
+            if (attachment == null || !addressable(attachment)) continue;
+            String id = attachment.optString("id", "").trim();
+            String name = displayName(attachment.optString("name", ""));
+            String mime = safeMime(attachment.optString("mime", ""));
+            out.append("<div class=\"attach\">");
+            if (RASTER_MIME.contains(mime)) {
+                out.append("<img class=\"attach-img\" src=\"https://").append(ATTACHMENT_HOST)
+                        .append('/').append(id).append("\" alt=\"").append(attr(name)).append("\">");
             } else {
-                out.append("<div class=\"who\">").append(who(kind, role, name)).append("</div>")
-                        .append("<div class=\"body\">")
-                        .append(body(text, message.optString("format", "text"))).append("</div>");
+                out.append("<div class=\"attach-file\"><span class=\"attach-name\">")
+                        .append(escape(name)).append("</span><span class=\"attach-meta\">")
+                        .append(escape(mime)).append(" \u00b7 ")
+                        .append(escape(sizeText(Math.max(0L, attachment.optLong("size", 0L)))))
+                        .append("</span></div>");
             }
             out.append("</div>");
         }
-        return out.toString();
+    }
+
+    /** The pane's own gate for reachable attachments: strict lowercase 32-hex ids. */
+    private static boolean addressable(JSONObject attachment) {
+        return ATTACHMENT_ID.matcher(attachment.optString("id", "").trim()).matches();
+    }
+
+    /** Ids the newest conversation rendered as images — the only ids the loader may see. */
+    private static Set<String> collectAttachmentIds(JSONObject payload) {
+        JSONArray messages = payload == null ? null : payload.optJSONArray("messages");
+        if (messages == null) return Collections.emptySet();
+        Set<String> ids = new HashSet<>();
+        for (int i = 0; i < messages.length(); i++) {
+            JSONObject message = messages.optJSONObject(i);
+            if (message == null) continue;
+            JSONArray attachments = message.optJSONArray("attachments");
+            if (attachments == null) continue;
+            for (int j = 0; j < attachments.length(); j++) {
+                JSONObject attachment = attachments.optJSONObject(j);
+                if (attachment == null || !addressable(attachment)) continue;
+                if (RASTER_MIME.contains(safeMime(attachment.optString("mime", "")))) {
+                    ids.add(attachment.optString("id", "").trim());
+                }
+            }
+        }
+        return ids.isEmpty() ? Collections.emptySet() : Collections.unmodifiableSet(ids);
+    }
+
+    /** Display filename from untrusted text: trimmed, bounded, never used raw as markup. */
+    private static String displayName(String raw) {
+        String name = raw.trim();
+        if (name.isEmpty()) return "attachment";
+        return name.length() > 120 ? name.substring(0, 120) + "\u2026" : name;
+    }
+
+    /** Normalized mime from untrusted text; anything unrecognizable reads as a plain file. */
+    private static String safeMime(String raw) {
+        String mime = raw.trim().toLowerCase(Locale.ROOT);
+        return SAFE_MIME.matcher(mime).matches() ? mime : "application/octet-stream";
+    }
+
+    private static String sizeText(long size) {
+        if (size < 1024L) return size + " B";
+        if (size < 1024L * 1024L) return String.format(Locale.ROOT, "%.1f KB", size / 1024.0);
+        return String.format(Locale.ROOT, "%.1f MB", size / (1024.0 * 1024.0));
+    }
+
+    /** Escapes an attribute value: entity encoding plus quotes. */
+    private static String attr(String s) {
+        return escape(s).replace("\"", "&quot;");
+    }
+
+    private static WebResourceResponse blocked() {
+        return new WebResourceResponse("text/plain", "utf-8", new ByteArrayInputStream(new byte[0]));
     }
 
     /** Escaped role label (fixed wording for known roles) plus the optional name. */

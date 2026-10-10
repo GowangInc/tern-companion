@@ -9,9 +9,10 @@ The Android app talks to `tern_bridge.py` on your computer. The bridge uses Tern
 - Save multiple computers with encrypted credentials.
 - Pair with a camera QR scan or a saved QR image.
 - Group live terminal blocks by session. Hide Flow/background sessions until you enable the toggle below the list.
-- Read the active terminal screen, including Tern plugin surfaces.
-- Submit text and Enter with **Send**. **Paste** sends clipboard text without Enter.
-- Send Enter, Ctrl+C, Escape, Tab, arrow keys and **Ctrl+P** for compatible model cycling.
+- Read clean OMP chats with Markdown, image previews, file cards and collapsed technical activity; ordinary terminal blocks retain their terminal view.
+- Write multiline messages and submit with **Send**. Use Android’s native text-selection menu to paste without submitting.
+- Attach images or files through the system picker, including multi-select and image-only messages.
+- Open **Tools** for Enter, Ctrl+C, Escape, Tab, arrow keys and **Ctrl+P** for compatible model cycling.
 - Check GitHub for stable updates, download the APK and open Android’s installer for confirmation.
 
 ## Requirements
@@ -26,7 +27,7 @@ The public app ID is `io.github.gowanginc.terncompanion`. Earlier local builds u
 
 ## 1. Start the bridge on the computer
 
-Download this repository to each computer you want to control. Run the bridge from its directory, keeping `conversation.py` beside `tern_bridge.py`. On macOS, transcript discovery uses the system `/usr/sbin/lsof`; Linux uses `/proc`.
+Download this repository to each computer you want to control. Run the bridge from its directory, keeping `conversation.py` and `phone_uploads.py` beside `tern_bridge.py`. On macOS, transcript discovery uses the system `/usr/sbin/lsof`; Linux uses `/proc`.
 
 ### Private Tailscale access
 
@@ -102,6 +103,14 @@ The generator reads the existing bridge token. It does not rotate it or send it 
 
 Saved-image import uses Android’s file picker. It does not request access to all your files. The app stores saved credentials with Android Keystore AES-GCM and disables Android backup.
 
+### Chat attachments
+
+In an active OMP conversation, tap **＋**, then **Images** or **Files**. The system picker supports multiple selections. Review thumbnails and file cards above the composer; **✕** removes a pending item. **Send** submits the selected files with your message, or by themselves.
+
+Limits: eight attachments per message, 20 MiB per file. PNG, JPEG and WebP have chat previews; other files display their name, type and size. Originals are stored privately under `~/.tern/uploads/` on the selected computer and passed through OMP’s existing native `@file` mentions. Uploads and previews require the bridge token and the exact active OMP session; another session cannot retrieve them. Files remain stored after sending.
+
+Failed uploads or unconfirmed sends keep the draft and pending files. Check the PC before retrying an unconfirmed send. A newly launched OMP pane needs its first text message to create a transcript before files can be attached.
+
 For manual pairing, tap **Add a PC**. Supply the name, hostname or IP, separate port and bridge token. Do not put a path, query, embedded port or password in the address field.
 
 | Route | Address | Port | Cloudflare fields |
@@ -131,8 +140,8 @@ The updater rejects an unexpected package, different signing certificate, older 
 - **Cannot connect:** verify the bridge is running, the address is reachable and the separate port is correct.
 - **HTTP 401:** generate a new QR from the current bridge token and pair again.
 - **No sessions:** run `tern ls --json` on the computer. The bridge must run as the user who owns those sessions.
-- **Send not confirmed:** update both `tern_bridge.py` and `conversation.py`, then restart the bridge. OMP sends use one bracketed paste plus a literal carriage return, and success requires a newly persisted user message. If acceptance times out, the draft stays on the phone; check the desktop before retrying.
-- **Screen differs from desktop:** update both bridge files. OMP conversations come from the foreground process’s exact session transcript; other terminal blocks use Tern’s `capture --surfaces` support.
+- **Send not confirmed:** update `tern_bridge.py`, `conversation.py` and `phone_uploads.py`, then restart the bridge. OMP sends use one bracketed paste plus a literal carriage return, and success requires a newly persisted user message. If acceptance times out, the text and files stay on the phone; check the desktop before retrying.
+- **Screen differs from desktop:** update all three bridge files. OMP conversations come from the foreground process’s exact session transcript, including version-renamed OMP executables; other terminal blocks use Tern’s `capture --surfaces` support.
 - **Model does not cycle:** Ctrl+P reaches the terminal. Its meaning depends on the terminal program’s key bindings.
 - **Camera unavailable:** use **Load QR image**. Camera behavior still needs checking on each physical phone model.
 - **Update certificate mismatch:** use the official release. Do not uninstall the app to bypass the check.
@@ -165,6 +174,14 @@ python3 checks/check_terminal_settings.py --serial YOUR_ADB_SERIAL
 This exercises the native slider, preview, persistence and reset, restores the original font size, and force-stops the app. It does not change saved PCs or open backend sessions.
 
 A release APK must retain the publisher’s signing identity. Local debug APKs use a different signer and cannot receive production-signed updates in place.
+
+## 1.5.0 changes
+
+Fixed version-renamed OMP process detection so active conversations no longer fall back to a raw terminal dump. The chat surface uses readable user/assistant messages, grouped collapsible activity, a compact **Tools** menu and a pinned composer.
+
+Added Android image/file picking, multi-select, pending thumbnails and file cards, authenticated session-bound uploads, chat image previews and image-only sends. Files travel with the accepted native OMP prompt; failed sends preserve text and attachments. Deploy all three Python bridge files together and restart the bridge on every computer.
+
+Verified on Android 15: real image + text-file delivery, byte-for-byte original retrieval, an OMP reply identifying the image and reading the file, picker cancellation and multi-select, image-only delivery, exact 4,097-character rejection with preserved text/file/error, recovery after rejection, and saved font-size settings. Host/native boundary checks cover process identity, session isolation, upload framing/limits, acceptance, Markdown and attachment safety.
 
 ## 1.4.5 changes
 

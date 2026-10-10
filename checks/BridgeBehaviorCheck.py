@@ -13,6 +13,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 import subprocess
@@ -20,11 +21,31 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import tern_bridge as bridge
 import conversation
+import phone_uploads
+
+# Mirrors OMP's documented @file extractor: a quoted or bare mention that starts
+# a word. Used only to prove a generated prompt is a native mention the agent
+# would really read, never to restate bridge internals.
+NATIVE_MENTION_REGEX = re.compile("@(?:\"([^\"]+)\"|'([^']+)'|([^\\s@]+))")
+MENTION_BOUNDARY_REGEX = re.compile(r"[\s([{<\"'`]")
+
+
+def native_mentions(text: str) -> list[str]:
+    """The file paths OMP's own extractor would resolve from this prompt text."""
+    found: list[str] = []
+    for match in NATIVE_MENTION_REGEX.finditer(text):
+        if match.start() != 0 and not MENTION_BOUNDARY_REGEX.match(text[match.start() - 1]):
+            continue
+        raw = match.group(1) or match.group(2) or match.group(3)
+        if raw:
+            found.append(raw)
+    return found
 
 
 class Terminal:
@@ -131,12 +152,23 @@ class Terminal:
         return 0, ""
 
 
-class BridgeHttpChecks(unittest.TestCase):
+class BridgeHttpFixture(unittest.TestCase):
+    def build_terminal(self):
+        return Terminal()
+
     def setUp(self):
-        self.terminal = Terminal()
+        self.terminal = self.build_terminal()
         self.stub = patch.object(bridge, "run_tern", self.terminal.run)
         self.stub.start()
         self.addCleanup(self.stub.stop)
+        # A boundary double for the pane's file table: this synthetic terminal
+        # holds no transcript, so it stays an ordinary terminal.
+        open_paths = patch.object(bridge, "_open_paths", return_value=set())
+        open_paths.start()
+        self.addCleanup(open_paths.stop)
+        executable = patch.object(bridge, "_exe_path", return_value="")
+        executable.start()
+        self.addCleanup(executable.stop)
         self.token = secrets.token_hex(32)
         handler = type("SyntheticHandler", (bridge.Handler,), {"token": self.token})
         self.server = bridge.ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -168,6 +200,7 @@ class BridgeHttpChecks(unittest.TestCase):
     def send(self, kind, value, block="42"):
         return self.request("/send", {"block": block, "kind": kind, "value": value})[0]
 
+class BridgeHttpChecks(BridgeHttpFixture):
     def test_default_text_capture_is_readable_and_includes_scrollback(self):
         status, content_type, body = self.request("/capture", {"block": "qa/42"})
         self.assertEqual(status, 200)
@@ -249,8 +282,8 @@ class BridgeHttpChecks(unittest.TestCase):
         self.assertEqual(self.terminal.model_cycles, 1)
 
     def test_all_routes_require_authorization_before_work(self):
-        for method, path in [("GET", "/health"), ("GET", "/sessions"),
-                             ("POST", "/send"), ("POST", "/capture"),
+        for method, path in [("GET", "/health"), ("GET", "/sessions"), ("GET", "/attachment"),
+                             ("POST", "/send"), ("POST", "/capture"), ("POST", "/upload"),
                              ("POST", "/new"), ("POST", "/kill")]:
             with self.subTest(method=method, path=path):
                 self.assertEqual(self.request(path, {}, method=method, auth=False)[0], 401)
@@ -700,6 +733,463 @@ class ConversationCaptureChecks(unittest.TestCase):
     @staticmethod
     def joined_text(payload):
         return "".join(message["text"] for message in payload["messages"])
+
+
+class OmpSessionChecks(unittest.TestCase):
+    """A pane classifies as OMP only from its own process and its own transcript."""
+
+    SESSION = "33333333-3333-3333-3333-333333333333"
+    OTHER = "44444444-4444-4444-4444-444444444444"
+
+    def setUp(self):
+        self.state = tempfile.TemporaryDirectory()
+        self.addCleanup(self.state.cleanup)
+
+    def transcript(self, session=None, name_session=None, header=True, body=""):
+        """One candidate transcript file in a temp session store."""
+        path = Path(self.state.name) / f"2026-01-01T00-00-00-000Z_{name_session or session or self.SESSION}.jsonl"
+        lines = []
+        if header:
+            lines.append(json.dumps({"type": "title", "v": 1, "title": "Fixture"}))
+            lines.append(json.dumps({"type": "session", "version": 3, "id": session or self.SESSION,
+                                     "timestamp": "2026-01-01T00:00:00Z", "cwd": "/tmp"}))
+        path.write_text("".join(line + "\n" for line in lines) + body, encoding="utf-8")
+        return path
+
+    def resolve(self, open_paths, *, name="18.8.7", argv=("omp",), pid=4242, exe=""):
+        """Resolve block 42 against a synthetic foreground process and file table."""
+        foreground = {"pid": pid, "name": name, "argv": list(argv), "cwd": "/tmp"}
+        if open_paths is None:
+            # A non-OMP program's file table must never even be inspected.
+            paths = patch.object(bridge, "_open_paths",
+                                 side_effect=AssertionError("a non-OMP process has no OMP transcript"))
+        else:
+            paths = patch.object(bridge, "_open_paths", return_value=set(open_paths))
+        with patch.object(bridge, "run_tern",
+                          return_value=(0, json.dumps({"foreground": foreground}))), \
+                patch.object(bridge, "_exe_path", return_value=exe), paths:
+            return bridge.omp_session("42")
+
+    def test_version_renamed_omp_resolves_its_own_transcript(self):
+        path = self.transcript()
+        self.assertEqual(self.resolve({path}), path)
+
+    def test_classic_omp_identity_still_resolves(self):
+        path = self.transcript()
+        self.assertEqual(self.resolve({path}, name="omp", argv=("/usr/local/bin/omp",)), path)
+
+    def test_processes_holding_an_omp_transcript_are_not_omp(self):
+        path = self.transcript()
+        for name, argv in [("zsh", ("/bin/zsh", "-l")), ("vim", ("vim",)), ("18.8.7", ("cat",))]:
+            with self.subTest(name=name, argv=argv):
+                self.assertIsNone(self.resolve(None, name=name, argv=argv))
+        self.assertTrue(path.exists())
+
+    def test_a_tern_managed_version_binary_is_omp_by_its_own_executable(self):
+        path = self.transcript()
+        managed = self.resolve({path}, name="18.8.7", argv=(),
+                               exe="/Applications/Support/Tern/omp/versions/18.8.7")
+        self.assertEqual(managed, path)
+        link = self.resolve({path}, name="omp", argv=(),
+                            exe="/Applications/Support/Tern/omp/bin/omp")
+        self.assertEqual(link, path)
+        other = self.resolve(None, name="18.8.7", argv=(),
+                             exe="/Applications/Support/Other/versions/18.8.7")
+        self.assertIsNone(other)
+
+    def test_files_that_are_not_this_pane_own_transcript_are_ignored(self):
+        headerless = self.transcript(header=False, body=json.dumps({"type": "message"}) + "\n")
+        mismatched = self.transcript(name_session=self.OTHER)
+        log = Path(self.state.name) / "omp.2026-10-10.99574.log"
+        log.write_text("synthetic log\n", encoding="utf-8")
+        self.assertIsNone(self.resolve({headerless, mismatched, log}))
+
+    def test_no_open_transcript_and_no_process_id_stay_terminal(self):
+        self.assertIsNone(self.resolve(set()))
+        with self.assertRaises(RuntimeError):
+            self.resolve(set(), pid=0)
+
+    def test_two_confirmed_transcripts_are_refused_as_ambiguous(self):
+        first = self.transcript(self.SESSION)
+        second = self.transcript(self.OTHER)
+        with self.assertRaises(RuntimeError):
+            self.resolve({first, second})
+
+
+class UploadStoreChecks(unittest.TestCase):
+    """The private store's own layout, limits and conversation enrichment."""
+
+    SESSION = "55555555-5555-5555-5555-555555555555"
+    OTHER = "66666666-6666-6666-6666-666666666666"
+
+    def setUp(self):
+        self.state = tempfile.TemporaryDirectory()
+        self.addCleanup(self.state.cleanup)
+        self.store = Path(self.state.name) / "uploads"
+        root = patch.object(phone_uploads, "UPLOAD_ROOT", self.store)
+        root.start()
+        self.addCleanup(root.stop)
+
+    def store_one(self, payload=b"bytes", name="a.txt", mime="text/plain", session=None):
+        return phone_uploads.store(io.BytesIO(payload), len(payload), session=session or self.SESSION,
+                                   name=name, mime=mime)
+
+    def test_originals_and_metadata_are_private_and_generated(self):
+        record = self.store_one(b"payload", name="My Report (final).txt", mime="text/plain")
+        self.assertEqual(sorted(record), ["id", "mime", "name", "size"])
+        self.assertRegex(record["id"], r"[0-9a-f]{32}\Z")
+        self.assertEqual(record["name"], "My Report (final).txt")
+        self.assertEqual(record["size"], 7)
+        directory = phone_uploads.session_dir(self.SESSION)
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        original = phone_uploads.original(self.SESSION, record["id"])
+        self.assertEqual(original.read_bytes(), b"payload")
+        self.assertEqual(original.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn(record["name"], original.name)
+
+    def test_bad_inputs_are_rejected_without_storing_anything(self):
+        cases = [
+            dict(session="bad/session", name="a.bin", mime="text/plain"),
+            dict(session=self.SESSION, name="../a.bin", mime="text/plain"),
+            dict(session=self.SESSION, name="", mime="text/plain"),
+            dict(session=self.SESSION, name="a.bin", mime="not-a-mime"),
+        ]
+        for case in cases:
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                phone_uploads.store(io.BytesIO(b"data"), 4, **case)
+        for length in (0, phone_uploads.MAX_UPLOAD_BYTES + 1):
+            with self.subTest(length=length), self.assertRaises(ValueError):
+                phone_uploads.store(io.BytesIO(b"data"), length, session=self.SESSION,
+                                    name="a.bin", mime="")
+
+    def test_incomplete_body_never_becomes_a_usable_id(self):
+        with self.assertRaises(ValueError):
+            phone_uploads.store(io.BytesIO(b"short"), 10, session=self.SESSION,
+                                name="a.bin", mime="application/octet-stream")
+        self.assertEqual(list(phone_uploads.session_dir(self.SESSION).glob("*")), [])
+
+    def test_lookups_are_bound_to_one_session(self):
+        record = self.store_one()
+        self.assertEqual(phone_uploads.metadata(self.SESSION, record["id"]), record)
+        self.assertIsNone(phone_uploads.metadata(self.OTHER, record["id"]))
+        self.assertIsNone(phone_uploads.original(self.OTHER, record["id"]))
+        self.assertIsNone(phone_uploads.metadata(self.SESSION, "not-an-id"))
+        self.assertIsNone(phone_uploads.metadata(self.SESSION, "0" * 32))
+
+    def test_enrichment_removes_only_the_generated_mention_lines(self):
+        record = self.store_one(b"image", name="a.png", mime="image/png")
+        mention = phone_uploads.reference(phone_uploads.original(self.SESSION, record["id"]))
+        payload = {"session": self.SESSION, "messages": [
+            {"id": "u1", "role": "user", "text": "\n".join(["keep `code` & <markup>\n", mention])},
+            {"id": "u2", "role": "user", "text": "  " + mention},
+            {"id": "a1", "role": "assistant", "text": "reply " + mention},
+        ]}
+        enriched = phone_uploads.enrich_conversation(payload)
+        self.assertEqual(enriched["messages"][0]["text"], "keep `code` & <markup>\n")
+        self.assertEqual(enriched["messages"][0]["attachments"], [record])
+        self.assertNotIn("attachments", enriched["messages"][1])
+        self.assertEqual(enriched["messages"][1]["text"], "  " + mention)
+        self.assertEqual(enriched["messages"][2]["text"], "reply " + mention)
+        self.assertEqual(native_mentions("draft\n" + mention), [str(phone_uploads.original(
+            self.SESSION, record["id"]))])
+
+    def test_a_session_without_uploads_is_left_untouched(self):
+        payload = {"session": self.OTHER, "messages": [{"id": "u1", "role": "user", "text": "plain"}]}
+        self.assertIs(phone_uploads.enrich_conversation(payload), payload)
+        self.assertNotIn("attachments", payload["messages"][0])
+
+
+class OmpTerminal(Terminal):
+    """A Terminal double whose pane runs a version-renamed OMP in its own session.
+
+    A submit that takes the bracketed-paste path persists a real user record in
+    the fixture transcript, so acceptance is proven by an appended record rather
+    than by the CLI call itself.
+    """
+
+    def __init__(self, transcript):
+        super().__init__()
+        self.transcript = Path(transcript)
+        self.process_name = "18.8.7"
+        self.argv = ["omp"]
+        self.fail_send = False
+        self.persisted = []
+
+    def run(self, args, stdin_text=None):
+        if args[0] == "process":
+            return 0, json.dumps({"pane": 42, "foreground": {
+                "pid": 4242, "name": self.process_name, "argv": list(self.argv),
+                "cwd": str(self.transcript.parent)}})
+        if args[0] == "send" and self.fail_send:
+            raise RuntimeError("synthetic CLI rejection")
+        if args[0] == "send" and args[2] == "text" and args[3].startswith("\x1b[200~"):
+            prompt = args[3][len("\x1b[200~"):-len("\x1b[201~\r")]
+            self.persisted.append(prompt)
+            self.submitted.append(prompt)
+            self.persist(prompt)
+            return 0, ""
+        return super().run(args, stdin_text)
+
+    def persist(self, text):
+        """Append one persisted user message, as OMP itself would."""
+        record = {"type": "message", "id": secrets.token_hex(4), "parentId": self.last_entry_id(),
+                  "timestamp": "t", "message": {"role": "user", "content": text}}
+        with self.transcript.open("ab") as out:
+            out.write((json.dumps(record) + "\n").encode("utf-8"))
+
+    def last_entry_id(self):
+        for line in reversed(self.transcript.read_text(encoding="utf-8").splitlines()):
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict) and record.get("type") == "message":
+                return record.get("id")
+        return None
+
+
+class BridgeAttachmentChecks(BridgeHttpFixture):
+    """Uploads and native file mentions stay bound to the pane's own OMP session."""
+
+    SESSION = "77777777-7777-7777-7777-777777777777"
+    OTHER = "88888888-8888-8888-8888-888888888888"
+    BLOCK = "42"
+
+    def setUp(self):
+        self.state = tempfile.TemporaryDirectory()
+        self.addCleanup(self.state.cleanup)
+        self.transcript = self.transcript_for(self.SESSION)
+        # A space in the store path proves quoted mentions still resolve.
+        self.store = Path(self.state.name) / "with space" / "uploads"
+        root = patch.object(phone_uploads, "UPLOAD_ROOT", self.store)
+        root.start()
+        self.addCleanup(root.stop)
+        super().setUp()
+        paths = patch.object(bridge, "_open_paths", lambda pid: {self.transcript})
+        paths.start()
+        self.addCleanup(paths.stop)
+
+    def build_terminal(self):
+        return OmpTerminal(self.transcript)
+
+    def transcript_for(self, session):
+        path = Path(self.state.name) / f"2026-01-01T00-00-00-000Z_{session}.jsonl"
+        if not path.exists():
+            with path.open("w", encoding="utf-8") as out:
+                for record in ({"type": "title", "v": 1, "title": "Fixture"},
+                               {"type": "session", "version": 3, "id": session,
+                                "timestamp": "2026-01-01T00:00:00Z", "cwd": "/tmp"}):
+                    out.write(json.dumps(record) + "\n")
+        return path
+
+    def use_session(self, session):
+        """Point the pane's own process at another session's transcript."""
+        replacement = patch.object(bridge, "_open_paths", lambda pid: {self.transcript_for(session)})
+        replacement.start()
+        self.addCleanup(replacement.stop)
+
+    def upload(self, payload, name="photo.png", mime="image/png", block=None, auth=True):
+        query = urllib.parse.urlencode({"block": block or self.BLOCK, "name": name, "mime": mime})
+        return self.request("/upload?" + query, raw=payload, auth=auth,
+                            headers={"Content-Type": "application/octet-stream"})
+
+    def upload_one(self, payload, **kwargs):
+        status, _, body = self.upload(payload, **kwargs)
+        self.assertEqual(status, 200)
+        return json.loads(body)
+
+    def stored(self, upload_id, session=None):
+        directory = self.store / (session or self.SESSION)
+        if not directory.is_dir():
+            return []
+        return [path for path in directory.glob(upload_id + "*")
+                if not path.name.endswith(phone_uploads.SIDECAR_SUFFIX)]
+
+    def fetch(self, upload_id, block=None, auth=True):
+        """One authenticated attachment read, headers included."""
+        query = urllib.parse.urlencode({"block": block or self.BLOCK, "id": upload_id})
+        connection = http.client.HTTPConnection(*self.server.server_address, timeout=3)
+        try:
+            headers = {"Authorization": "Bearer " + self.token} if auth else {}
+            connection.request("GET", "/attachment?" + query, None, headers)
+            response = connection.getresponse()
+            return response.status, response.headers, response.read()
+        finally:
+            connection.close()
+
+    def raw_exchange(self, request_line, headers, body=b""):
+        """Send a hand-built request so framing can be wrong on purpose."""
+        with socket.create_connection(self.server.server_address, timeout=3) as client:
+            request = (request_line + "\r\nAuthorization: Bearer " + self.token + "\r\n"
+                       + headers + "\r\n").encode() + body
+            client.sendall(request)
+            client.shutdown(socket.SHUT_WR)
+            response = http.client.HTTPResponse(client)
+            response.begin()
+            status = response.status
+            response.read()
+        return status
+
+    def last_user_text(self):
+        for line in reversed(self.transcript.read_text(encoding="utf-8").splitlines()):
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict) and record.get("type") == "message":
+                return record["message"]["content"]
+        return None
+
+    def test_upload_round_trips_exact_bytes_from_a_private_store(self):
+        payload = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 3
+        record = self.upload_one(payload, name="Class Photos 世界 (1).png", mime="image/png")
+        self.assertEqual(sorted(record), ["id", "mime", "name", "size"])
+        self.assertRegex(record["id"], r"[0-9a-f]{32}\Z")
+        self.assertEqual(record["name"], "Class Photos 世界 (1).png")
+        self.assertEqual(record["mime"], "image/png")
+        self.assertEqual(record["size"], len(payload))
+        originals = self.stored(record["id"])
+        self.assertEqual(len(originals), 1)
+        self.assertEqual(originals[0].read_bytes(), payload)
+        self.assertEqual(originals[0].stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.store / self.SESSION).stat().st_mode & 0o777, 0o700)
+        self.assertNotIn(record["name"], originals[0].name)
+        status, headers, body = self.fetch(record["id"])
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["content-type"], "image/png")
+        self.assertEqual(headers["x-content-type-options"], "nosniff")
+        self.assertEqual(headers["cache-control"], "private, no-store")
+        self.assertEqual(headers["content-length"], str(len(payload)))
+        self.assertEqual(body, payload)
+
+    def test_non_image_attachments_are_served_as_opaque_bytes(self):
+        payload = b"%PDF-1.4 synthetic\n"
+        record = self.upload_one(payload, name="report.pdf", mime="application/pdf")
+        status, headers, body = self.fetch(record["id"])
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["content-type"], "application/octet-stream")
+        self.assertEqual(body, payload)
+
+    def test_uploads_and_attachments_require_auth_and_their_own_session(self):
+        self.assertEqual(self.upload(b"unauthorized", auth=False)[0], 401)
+        self.assertFalse(self.store.exists())
+        record = self.upload_one(b"synthetic", name="note.txt", mime="text/plain")
+        self.assertEqual(self.fetch(record["id"], auth=False)[0], 401)
+        self.use_session(self.OTHER)
+        self.assertEqual(self.fetch(record["id"])[0], 404)
+        status, _, body = self.request("/send", {"block": self.BLOCK, "kind": "submit",
+                                                "value": "steal it", "attachments": [record["id"]]})
+        self.assertEqual(status, 409)
+        self.assertTrue(json.loads(body)["error"])
+        self.assertEqual(self.terminal.persisted, [])
+        self.assertEqual(self.last_user_text(), None)
+
+    def test_non_omp_panes_reject_uploads_and_keep_terminal_submits(self):
+        record = self.upload_one(b"synthetic")
+        with patch.object(bridge, "_open_paths", lambda pid: set()):
+            self.assertEqual(self.upload(b"more")[0], 409)
+            self.assertEqual(self.fetch(record["id"])[0], 409)
+            self.assertEqual(self.request("/send", {"block": self.BLOCK, "kind": "submit",
+                                                    "value": "shell cmd"})[0], 200)
+            self.assertEqual(self.terminal.submitted, ["shell cmd"])
+        self.assertEqual(self.terminal.persisted, [])
+
+    def test_framing_limits_and_partial_bodies_never_become_ids(self):
+        query = "block=42&name=a.png&mime=image/png"
+        cases = [
+            ("POST /upload?" + query + " HTTP/1.0",
+             "Content-Length: " + str(phone_uploads.MAX_UPLOAD_BYTES + 1) + "\r\n", b""),
+            ("POST /upload?" + query + " HTTP/1.0", "Transfer-Encoding: chunked\r\n", b"0\r\n\r\n"),
+            ("POST /upload?" + query + " HTTP/1.0",
+             "Content-Length: 2\r\nContent-Length: 2\r\n", b"ab"),
+            ("POST /upload?" + query + " HTTP/1.0", "Content-Length: 10\r\n", b"abc"),
+            ("POST /upload?" + query + " HTTP/1.0", "Content-Length: 0\r\n", b""),
+        ]
+        for line, headers, body in cases:
+            with self.subTest(headers=headers):
+                self.assertEqual(self.raw_exchange(line, headers, body), 400)
+        self.assertEqual([path.name for path in self.store.glob("**/*") if path.is_file()], [])
+        self.assertEqual(self.upload(b"synthetic", name="../../etc/passwd")[0], 400)
+        self.assertEqual(self.upload(b"synthetic", mime="not-a-mime")[0], 400)
+        self.assertEqual(self.upload(b"synthetic", name="")[0], 400)
+        self.assertEqual([path.name for path in self.store.glob("**/*") if path.is_file()], [])
+
+    def test_submit_appends_native_file_mentions_to_the_accepted_prompt(self):
+        image = b"\x89PNG\r\n\x1a\n" + bytes(range(64))
+        first = self.upload_one(image, name="shot one.png", mime="image/png")
+        second = self.upload_one(b"note body\n", name="notes.txt", mime="text/plain")
+        draft = "Look at these\n> keep `code` & <markup>\n"
+        attachments = [first["id"], second["id"]]
+        status, content_type, body = self.request("/send", {"block": self.BLOCK, "kind": "submit",
+                                                            "value": draft, "attachments": attachments})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"ok": True, "accepted": True})
+        paths = [str(path) for upload in attachments for path in self.stored(upload)]
+        expected = "\n".join([draft] + ['@"%s"' % path for path in paths])
+        self.assertEqual(self.terminal.persisted, [expected])
+        self.assertEqual(self.last_user_text(), expected)
+        self.assertEqual(native_mentions(expected), paths)
+        self.assertEqual(self.stored(first["id"])[0].read_bytes(), image)
+        self.assertEqual(self.stored(second["id"])[0].read_bytes(), b"note body\n")
+        status, _, body = self.request("/capture", {"block": self.BLOCK, "format": "conversation"})
+        payload = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["type"], "conversation")
+        self.assertEqual(payload["session"], self.SESSION)
+        message, = payload["messages"]
+        self.assertEqual(message["role"], "user")
+        self.assertEqual(message["text"], draft)
+        self.assertEqual(message["attachments"], [
+            {"id": first["id"], "name": "shot one.png", "mime": "image/png", "size": len(image)},
+            {"id": second["id"], "name": "notes.txt", "mime": "text/plain", "size": 10}])
+
+    def test_image_only_send_is_its_own_mention_and_still_renders(self):
+        record = self.upload_one(b"\x89PNG\r\n\x1a\n0", name="photo.png", mime="image/png")
+        status, _, body = self.request("/send", {"block": self.BLOCK, "kind": "submit",
+                                                "value": "", "attachments": [record["id"]]})
+        self.assertEqual(status, 200)
+        expected = phone_uploads.reference(self.stored(record["id"])[0])
+        self.assertEqual(self.terminal.persisted, [expected])
+        status, _, body = self.request("/capture", {"block": self.BLOCK, "format": "conversation"})
+        message, = json.loads(body)["messages"]
+        self.assertEqual(message["text"], "")
+        self.assertEqual([attachment["id"] for attachment in message["attachments"]], [record["id"]])
+
+    def test_attachment_rejections_never_reach_the_pty(self):
+        record = self.upload_one(b"synthetic")
+        malformed = [
+            {"attachments": [record["id"]] * 9},
+            {"attachments": ["not-hex"]},
+            {"attachments": [record["id"]], "kind": "text", "value": "x"},
+            {"attachments": [record["id"]], "kind": "paste", "value": "x"},
+            {"attachments": [], "value": ""},
+            {"attachments": record["id"]},
+        ]
+        for case in malformed:
+            with self.subTest(case=case):
+                body = {"block": self.BLOCK, "kind": "submit", "value": "unused"}
+                body.update(case)
+                self.assertEqual(self.request("/send", body)[0], 400)
+        for unknown in ({"attachments": ["0" * 32]}, {"attachments": [record["id"]] * 1 + ["1" * 32]}):
+            with self.subTest(case=unknown):
+                body = {"block": self.BLOCK, "kind": "submit", "value": "unused"}
+                body.update(unknown)
+                self.assertEqual(self.request("/send", body)[0], 409)
+        self.assertEqual(self.terminal.persisted, [])
+        self.assertEqual(self.terminal.pasted, [])
+        self.assertEqual(self.last_user_text(), None)
+
+    def test_a_failed_send_keeps_the_upload_for_a_retry(self):
+        record = self.upload_one(b"synthetic bytes", name="keep.bin", mime="application/octet-stream")
+        before = self.transcript.read_text(encoding="utf-8")
+        self.terminal.fail_send = True
+        status, _, body = self.request("/send", {"block": self.BLOCK, "kind": "submit",
+                                                "value": "retry me", "attachments": [record["id"]]})
+        self.assertEqual(status, 409)
+        self.assertTrue(json.loads(body)["error"])
+        self.assertEqual(self.transcript.read_text(encoding="utf-8"), before)
+        self.assertEqual(self.stored(record["id"])[0].read_bytes(), b"synthetic bytes")
+        self.assertEqual(self.fetch(record["id"])[0], 200)
 
 
 if __name__ == "__main__":

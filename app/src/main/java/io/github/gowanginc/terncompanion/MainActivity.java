@@ -3,9 +3,11 @@ package io.github.gowanginc.terncompanion;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ClipData;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Path;
@@ -14,22 +16,27 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.graphics.drawable.StateListDrawable;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.text.Editable;
 import android.text.InputType;
 import android.text.TextUtils;
+import android.text.TextWatcher;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
+import android.webkit.WebResourceResponse;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.HorizontalScrollView;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
@@ -43,10 +50,13 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.FilterInputStream;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -74,6 +84,9 @@ public final class MainActivity extends Activity {
     private static final int TEXT_SIZE_DEFAULT = 16;
     private static final int TEXT_SIZE_MIN = 12;
     private static final int TEXT_SIZE_MAX = 24;
+    private static final int REQUEST_ATTACH = 4711;
+    private static final Pattern UPLOAD_ID = Pattern.compile("[0-9a-f]{32}");
+    private static final int HTTP_BODY_LIMIT = 1_000_000;
 
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -90,6 +103,15 @@ public final class MainActivity extends Activity {
     private JSONArray lastSessions;
     private int viewGen = 0;
     private String screen = "hosts";
+    private final ArrayList<Pending> pendingAttachments = new ArrayList<>();
+    private LinearLayout attachmentTray;
+    private ScrollView attachmentTrayScroll;
+    private EditText draft;
+    private Button sendButton;
+    private Button attachButton;
+    private boolean toolsExpanded;
+    private boolean sendBusy;
+    private int pickerGen = -1;
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -112,7 +134,7 @@ public final class MainActivity extends Activity {
                     | WindowInsetsCompat.Type.displayCutout() | WindowInsetsCompat.Type.ime());
             view.setPadding(safe.left, safe.top, safe.right, safe.bottom);
             imeVisible = insets.isVisible(WindowInsetsCompat.Type.ime());
-            if (terminalKeys != null) terminalKeys.setVisibility(imeVisible ? View.GONE : View.VISIBLE);
+            updateStripVisibility();
             return insets;
         });
         setContentView(root);
@@ -441,10 +463,11 @@ public final class MainActivity extends Activity {
         LinearLayout page = column();
         root.addView(page, new LinearLayout.LayoutParams(-1, -1));
 
-        // Calm app bar; the reading surface carries no nested card borders.
+        // Compact chat header: identity, mode, Tools and Settings. The reading
+        // surface carries no nested card borders.
         LinearLayout header = row();
         header.setGravity(Gravity.CENTER_VERTICAL);
-        header.setPadding(dp(8), 0, dp(16), 0);
+        header.setPadding(dp(8), dp(6), dp(8), dp(6));
         header.setBackgroundColor(PAPER);
         Button backBtn = smallButton("‹");
         backBtn.setTextSize(28);
@@ -453,15 +476,37 @@ public final class MainActivity extends Activity {
         backBtn.setContentDescription("Back");
         backBtn.setOnClickListener(v -> connect(h));
         header.addView(backBtn, new LinearLayout.LayoutParams(dp(48), dp(48)));
-        TextView headLabel = text(label, 16, INK, Typeface.DEFAULT, Typeface.BOLD);
+        LinearLayout titles = column();
+        LinearLayout.LayoutParams titlesLp = weight1();
+        titlesLp.leftMargin = dp(8);
+        TextView headLabel = text(label, 17, INK, Typeface.DEFAULT, Typeface.BOLD);
         headLabel.setSingleLine(true);
         headLabel.setEllipsize(TextUtils.TruncateAt.END);
-        LinearLayout.LayoutParams headLp = weight1();
-        headLp.leftMargin = dp(8);
-        header.addView(headLabel, headLp);
-        TextView live = text("Live", 12, GREEN, Typeface.DEFAULT, Typeface.NORMAL);
-        header.addView(live);
-        page.addView(header, new LinearLayout.LayoutParams(-1, dp(56)));
+        titles.addView(headLabel);
+        LinearLayout subRow = row();
+        TextView subLabel = text(h.name + "  ·  " + sessionName, 12, MUTED, Typeface.DEFAULT, Typeface.NORMAL);
+        subLabel.setSingleLine(true);
+        subLabel.setEllipsize(TextUtils.TruncateAt.END);
+        subRow.addView(subLabel, weight1());
+        TextView live = text("Connecting…", 12, MUTED, Typeface.DEFAULT, Typeface.BOLD);
+        subRow.addView(live);
+        titles.addView(subRow, mp(-1, -2, 0, 2, 0, 0));
+        header.addView(titles, titlesLp);
+        final Button toolsBtn = smallButton("Tools");
+        toolsBtn.setTextSize(13);
+        toolsBtn.setMinWidth(dp(56));
+        toolsBtn.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2217634e),
+                null, bg(Color.WHITE, Color.TRANSPARENT)));
+        toolsBtn.setContentDescription("Tools and keyboard shortcuts");
+        ViewCompat.setStateDescription(toolsBtn, "Collapsed");
+        toolsBtn.setOnClickListener(v -> {
+            toolsExpanded = !toolsExpanded;
+            toolsBtn.setSelected(toolsExpanded);
+            ViewCompat.setStateDescription(toolsBtn, toolsExpanded ? "Expanded" : "Collapsed");
+            updateStripVisibility();
+        });
+        header.addView(toolsBtn, new LinearLayout.LayoutParams(-2, dp(48)));
+        page.addView(header, new LinearLayout.LayoutParams(-1, -2));
         View headerRule = rule();
         headerRule.setBackgroundColor(0xffb4c8b7);
         page.addView(headerRule, new LinearLayout.LayoutParams(-1, dp1()));
@@ -510,13 +555,22 @@ public final class MainActivity extends Activity {
         status.setPadding(dp(12), dp(4), dp(12), dp(4));
         page.addView(status, new LinearLayout.LayoutParams(-1, -2));
 
+        // Attachment tray: pending files for this conversation, pinned above the composer.
+        attachmentTray = column();
+        attachmentTray.setPadding(dp(12), dp(4), dp(12), dp(4));
+        attachmentTray.setBackgroundColor(PAPER);
+        attachmentTrayScroll = new ScrollView(this);
+        attachmentTrayScroll.setVisibility(View.GONE);
+        attachmentTrayScroll.addView(attachmentTray);
+        page.addView(attachmentTrayScroll, new LinearLayout.LayoutParams(-1, 0));
+
         // 3. Shortcut strip: one horizontally scrollable row of terminal keys.
         String[][] keys = {
                 {"Ctrl+P", "ctrl+p"}, {"Ctrl+C", "ctrl+c"}, {"Esc", "Escape"}, {"Tab", "Tab"},
                 {"Enter", "Enter"}, {"↑", "Up"}, {"↓", "Down"}, {"←", "Left"}, {"→", "Right"}};
         HorizontalScrollView stripScroll = new HorizontalScrollView(this);
         terminalKeys = stripScroll;
-        stripScroll.setVisibility(imeVisible ? View.GONE : View.VISIBLE);
+        stripScroll.setVisibility(toolsExpanded && !imeVisible ? View.VISIBLE : View.GONE);
         stripScroll.setHorizontalScrollBarEnabled(false);
         LinearLayout strip = row();
         strip.setPadding(dp(12), dp(4), dp(12), dp(4));
@@ -539,10 +593,10 @@ public final class MainActivity extends Activity {
         page.addView(stripScroll, new LinearLayout.LayoutParams(-1, dp(56)));
         ViewCompat.requestApplyInsets(root);
 
-        // 4. Pinned composer: native multiline EditText plus an explicit Send.
+        // 4. Pinned composer: attach control, multiline draft, explicit Send.
         LinearLayout composer = row();
         composer.setGravity(Gravity.BOTTOM);
-        composer.setPadding(dp(16), dp(8), dp(16), dp(12));
+        composer.setPadding(dp(12), dp(8), dp(12), dp(10));
         composer.setBackgroundColor(CARD);
         final EditText input = new EditText(this);
         input.setHint("Message or command…");
@@ -561,22 +615,47 @@ public final class MainActivity extends Activity {
         fieldBackground.addState(new int[]{android.R.attr.state_focused}, bg(CARD, GREEN));
         fieldBackground.addState(new int[]{}, bg(0xffeeeee5, MUTED));
         input.setBackground(fieldBackground);
-        input.setContentDescription("Text to send to the terminal");
-        composer.addView(input, weight1());
-        final Button sendButton = button("Send");
-        sendButton.setTextSize(14);
-        sendButton.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        sendButton.setMinWidth(dp(64));
-        sendButton.setMinimumWidth(dp(64));
-        sendButton.setTextColor(PAPER);
-        sendButton.setBackground(new RippleDrawable(ColorStateList.valueOf(0x44ffffff),
+        input.setContentDescription("Message or command");
+        draft = input;
+        final Button attach = smallButton("＋");
+        attach.setTextSize(22);
+        attach.setMinWidth(dp(48));
+        attach.setMinimumWidth(dp(48));
+        attach.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2217634e),
+                null, bg(0xffeeeee5, MUTED)));
+        attach.setContentDescription("Attach image or file");
+        attach.setOnClickListener(v -> launchPicker());
+        attachButton = attach;
+        composer.addView(attach, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        LinearLayout.LayoutParams inputLp = weight1();
+        inputLp.leftMargin = dp(8);
+        composer.addView(input, inputLp);
+        final Button send = button("Send");
+        send.setTextSize(14);
+        send.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        send.setMinWidth(dp(64));
+        send.setMinimumWidth(dp(64));
+        send.setTextColor(PAPER);
+        send.setBackground(new RippleDrawable(ColorStateList.valueOf(0x44ffffff),
                 bg(GREEN, GREEN), null));
-        sendButton.setContentDescription("Send message");
+        send.setContentDescription("Send message");
         LinearLayout.LayoutParams sendLp = new LinearLayout.LayoutParams(-2, dp(48));
         sendLp.leftMargin = dp(8);
-        composer.addView(sendButton, sendLp);
+        composer.addView(send, sendLp);
+        sendButton = send;
         page.addView(composer, new LinearLayout.LayoutParams(-1, -2));
-        sendButton.setOnClickListener(v -> submitDraft(h, sessionName, blockId, input, sendButton));
+        input.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
+            @Override public void afterTextChanged(Editable s) { updateSendEnabled(); }
+        });
+        send.setOnClickListener(v -> submitDraft(h, sessionName, blockId, input, send));
+        updateSendEnabled();
+
+        // Chat captions may carry image attachments; only the 32-hex ids the
+        // renderer mints are ever streamed, and only through the authenticated
+        // bridge GET. Everything else the WebView asks for is refused.
+        pane.setAttachmentLoader(id -> loadAttachment(h, sessionName, blockId, id));
 
         pane.setOnTailChangeListener(atTail -> pane.setJumpToLatestVisible(!atTail));
 
@@ -618,11 +697,14 @@ public final class MainActivity extends Activity {
                                 } else {
                                     pane.loadCapture(capture.optString("html"));
                                 }
-                                live.setText(requestedEnd >= 0 ? "History" : "Live");
+                                live.setTextColor(GREEN);
+                                live.setText("conversation".equals(captureType)
+                                        ? (requestedEnd >= 0 ? "History" : "Chat") : "Terminal");
                             } else {
                                 status(captureNote, "Not live: " + r.body);
                                 earlierButton.setEnabled(pageStart[0] > 0);
                                 latestButton.setEnabled(requestedEnd >= 0);
+                                live.setTextColor(CORAL);
                                 live.setText("Offline");
                             }
                             scheduleNext(gen, this);
@@ -633,6 +715,7 @@ public final class MainActivity extends Activity {
                             status(captureNote, "Screen unavailable: " + shortError(e));
                             earlierButton.setEnabled(pageStart[0] > 0);
                             latestButton.setEnabled(requestedEnd >= 0);
+                            live.setTextColor(CORAL);
                             live.setText("Offline");
                             scheduleNext(gen, this);
                         });
@@ -669,15 +752,65 @@ public final class MainActivity extends Activity {
         ui.postDelayed(tick, 2000);
     }
 
-    /** Sends the draft and Enter in one action. The draft stays editable while the
-     *  request is in flight and is cleared on success only if it was not edited. */
+    /** Uploads any pending attachments, then submits the draft (and Enter) in one
+     *  accepted action. The draft stays editable in flight; text and files are
+     *  cleared only when the accepted snapshot is still unchanged. */
     private void submitDraft(Host h, String sessionName, String blockId, EditText input, Button sendButton) {
         final String snapshot = input.getText().toString();
-        if (snapshot.isEmpty() || !sendButton.isEnabled()) return;
-        sendButton.setEnabled(false);
-        send(h, sessionName, blockId, "submit", snapshot, ok -> {
-            sendButton.setEnabled(true);
-            if (ok && input.getText().toString().equals(snapshot)) input.setText("");
+        final ArrayList<Pending> snapshotPending = new ArrayList<>(pendingAttachments);
+        if (snapshot.trim().isEmpty() && snapshotPending.isEmpty()) return;
+        if (sendBusy || !sendButton.isEnabled()) return;
+        final int gen = viewGen;
+        setBusy(true);
+        final String selector = sessionName + "/" + blockId;
+        io.execute(() -> {
+            try {
+                JSONArray ids = new JSONArray();
+                for (int i = 0; i < snapshotPending.size(); i++) {
+                    Pending p = snapshotPending.get(i);
+                    if (p.id == null) {
+                        final int at = i + 1;
+                        final int total = snapshotPending.size();
+                        runUi(() -> {
+                            if (gen == viewGen) status("Uploading " + at + " of " + total + "…");
+                        });
+                        p.id = upload(h, selector, p);
+                    }
+                    ids.put(p.id);
+                }
+                if (!snapshotPending.isEmpty()) runUi(() -> {
+                    if (gen == viewGen) status("Sending…");
+                });
+                JSONObject b = new JSONObject().put("block", selector).put("kind", "submit")
+                        .put("value", snapshot).put("attachments", ids);
+                HttpResult r = http(h, "POST", "/send", b);
+                if (r.code != 200) throw new Exception(r.body);
+                JSONObject acknowledgement = new JSONObject(r.body);
+                if (!acknowledgement.optBoolean("ok")
+                        || (!snapshotPending.isEmpty() && !acknowledgement.optBoolean("accepted"))) {
+                    throw new Exception("Delivery not confirmed — check the PC before retrying.");
+                }
+                runUi(() -> {
+                    if (gen != viewGen) return;
+                    status("");
+                    setBusy(false);
+                    boolean sameText = input.getText().toString().equals(snapshot);
+                    boolean sameAttachments = pendingAttachments.equals(snapshotPending);
+                    if (sameText) input.setText("");
+                    if (sameAttachments) {
+                        pendingAttachments.clear();
+                        rebuildTray();
+                    }
+                    updateSendEnabled();
+                });
+            } catch (Exception e) {
+                runUi(() -> {
+                    if (gen != viewGen) return;
+                    status("Send failed: " + shortError(e) + " Your text and files are kept.");
+                    setBusy(false);
+                    updateSendEnabled();
+                });
+            }
         });
     }
 
@@ -703,6 +836,288 @@ public final class MainActivity extends Activity {
                 });
             }
         });
+    }
+
+    // ---------- attachments ----------
+
+    /** One file chosen for this conversation; uploaded lazily on first send. */
+    private static final class Pending {
+        final Uri uri;
+        final String name;
+        final String mime;
+        final long size;
+        String id;
+        Bitmap thumb;
+
+        Pending(Uri uri, String name, String mime, long size) {
+            this.uri = uri;
+            this.name = name;
+            this.mime = mime == null ? "" : mime;
+            this.size = size;
+        }
+    }
+
+    private void launchPicker() {
+        if (sendBusy) return;
+        if (pendingAttachments.size() >= AttachmentSupport.MAX_FILES) {
+            status("Up to 8 attachments per message.");
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Attach")
+                .setItems(new String[]{"Images", "Files"}, (d, which) -> openDocument(which == 0 ? "image/*" : "*/*"))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** Opens the system document picker for images or for any file, both multi-select. */
+    private void openDocument(String type) {
+        pickerGen = viewGen; // a result arriving after a screen change is dropped
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType(type);
+        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        try {
+            startActivityForResult(intent, REQUEST_ATTACH);
+        } catch (Exception e) {
+            status("No file picker available: " + shortError(e));
+        }
+    }
+
+    private void addPicked(List<Uri> uris) {
+        if (uris == null || uris.isEmpty()) return;
+        int room = AttachmentSupport.MAX_FILES - pendingAttachments.size();
+        if (room <= 0) {
+            status("Up to 8 attachments per message.");
+            return;
+        }
+        final boolean clipped = uris.size() > room;
+        final List<Uri> take = new ArrayList<>(uris.subList(0, Math.min(room, uris.size())));
+        final int gen = viewGen;
+        io.execute(() -> {
+            List<AttachmentSupport.Doc> docs = AttachmentSupport.resolve(this, take);
+            final ArrayList<Pending> added = new ArrayList<>();
+            final ArrayList<String> rejected = new ArrayList<>();
+            for (AttachmentSupport.Doc d : docs) {
+                long size = d.knownSize && d.size >= 0 ? d.size
+                        : AttachmentSupport.measureBytes(this, d.uri, AttachmentSupport.MAX_BYTES);
+                if (size < 0 || size > AttachmentSupport.MAX_BYTES) {
+                    rejected.add(d.name);
+                    continue;
+                }
+                added.add(new Pending(d.uri, d.name, d.mime, size));
+            }
+            runUi(() -> {
+                if (gen != viewGen) return;
+                pendingAttachments.addAll(added);
+                rebuildTray();
+                updateSendEnabled();
+                if (!rejected.isEmpty()) {
+                    status("Skipped " + rejected.size() + (rejected.size() == 1 ? " file" : " files")
+                            + " unreadable or over 20 MiB: " + rejected.get(0) + (rejected.size() > 1 ? "…" : ""));
+                } else if (clipped) {
+                    status("Added the first " + room + " — 8 attachments max.");
+                }
+            });
+        });
+    }
+
+    private void rebuildTray() {
+        if (attachmentTray == null) return;
+        attachmentTray.removeAllViews();
+        for (Pending p : pendingAttachments) attachmentTray.addView(trayRow(p));
+        boolean empty = pendingAttachments.isEmpty();
+        attachmentTrayScroll.setVisibility(empty ? View.GONE : View.VISIBLE);
+        // ponytail: a two-row viewport keeps Send reachable with all eight files.
+        attachmentTrayScroll.getLayoutParams().height = empty ? 0
+                : dp(Math.min(144, pendingAttachments.size() * 64 + 8));
+        attachmentTrayScroll.requestLayout();
+    }
+
+    private View trayRow(final Pending p) {
+        LinearLayout row = row();
+        row.setBackground(bg(CARD, EDGE));
+        row.setPadding(dp(8), dp(6), dp(8), dp(6));
+        if (AttachmentSupport.isPreviewableImage(p.mime)) {
+            ImageView thumb = new ImageView(this);
+            thumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            thumb.setContentDescription("Image preview");
+            if (p.thumb != null) thumb.setImageBitmap(p.thumb);
+            else decodeThumb(p, thumb);
+            row.addView(thumb, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        } else {
+            String ext = AttachmentSupport.extension(p.name);
+            TextView tag = text(ext.isEmpty() ? "FILE" : ext.toUpperCase(java.util.Locale.ROOT), 11,
+                    GREEN, Typeface.MONOSPACE, Typeface.BOLD);
+            tag.setGravity(Gravity.CENTER);
+            tag.setBackground(bg(0xffeeeee5, EDGE));
+            row.addView(tag, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        }
+        LinearLayout meta = column();
+        LinearLayout.LayoutParams metaLp = weight1();
+        metaLp.leftMargin = dp(10);
+        TextView name = text(p.name, 14, INK, Typeface.DEFAULT, Typeface.NORMAL);
+        name.setSingleLine(true);
+        name.setEllipsize(TextUtils.TruncateAt.END);
+        meta.addView(name);
+        String type = p.mime == null || p.mime.isEmpty() ? "unknown type" : p.mime;
+        meta.addView(text(type + "  ·  " + formatSize(p.size), 11, MUTED, Typeface.DEFAULT, Typeface.NORMAL));
+        row.addView(meta, metaLp);
+        Button remove = smallButton("✕");
+        remove.setTextSize(16);
+        remove.setContentDescription("Remove " + p.name);
+        remove.setOnClickListener(v -> {
+            pendingAttachments.remove(p);
+            rebuildTray();
+            updateSendEnabled();
+        });
+        row.addView(remove, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        return row;
+    }
+
+    private void decodeThumb(final Pending p, final ImageView view) {
+        final int gen = viewGen;
+        final int maxPx = dp(96);
+        io.execute(() -> {
+            final Bitmap bitmap = AttachmentSupport.thumbnail(this, p.uri, maxPx);
+            runUi(() -> {
+                if (gen != viewGen || bitmap == null) return;
+                p.thumb = bitmap;
+                view.setImageBitmap(bitmap);
+            });
+        });
+    }
+
+    private void updateSendEnabled() {
+        if (sendButton == null) return;
+        boolean hasText = draft != null && !draft.getText().toString().trim().isEmpty();
+        sendButton.setEnabled(!sendBusy && (hasText || !pendingAttachments.isEmpty()));
+    }
+
+    private void setBusy(boolean busy) {
+        sendBusy = busy;
+        if (attachButton != null) attachButton.setEnabled(!busy);
+        updateSendEnabled();
+    }
+
+    private void updateStripVisibility() {
+        if (terminalKeys != null) {
+            terminalKeys.setVisibility(toolsExpanded && !imeVisible ? View.VISIBLE : View.GONE);
+        }
+    }
+
+    private static String formatSize(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return (bytes / 1024) + " KB";
+        return String.format(java.util.Locale.ROOT, "%.1f MB", bytes / (1024.0 * 1024.0));
+    }
+
+    /** Uploads one picked file as raw bytes with a fixed Content-Length. */
+    private String upload(Host h, String selector, Pending p) throws Exception {
+        String mime = p.mime == null || p.mime.trim().isEmpty() ? "application/octet-stream" : p.mime;
+        String query = "?block=" + URLEncoder.encode(selector, "UTF-8")
+                + "&name=" + URLEncoder.encode(p.name, "UTF-8")
+                + "&mime=" + URLEncoder.encode(mime, "UTF-8");
+        long started = SystemClock.elapsedRealtime();
+        HttpURLConnection c = (HttpURLConnection) new URL(h.baseUrl() + "/upload" + query).openConnection();
+        try {
+            c.setRequestMethod("POST");
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(120000);
+            authorize(c, h);
+            c.setRequestProperty("Content-Type", "application/octet-stream");
+            c.setDoOutput(true);
+            c.setFixedLengthStreamingMode(p.size);
+            try (InputStream in = getContentResolver().openInputStream(p.uri);
+                 OutputStream os = c.getOutputStream()) {
+                if (in == null) throw new Exception("That file can no longer be read.");
+                byte[] buffer = new byte[8 * 1024];
+                long written = 0;
+                int read;
+                while ((read = in.read(buffer)) > 0) {
+                    os.write(buffer, 0, read);
+                    written += read;
+                }
+                if (written != p.size) throw new Exception("That file changed while uploading.");
+            }
+            int code = c.getResponseCode();
+            String body = readAll(code >= 400 ? c.getErrorStream() : c.getInputStream(), 200_000);
+            Log.d(TAG, "upload status=" + code + " ms=" + (SystemClock.elapsedRealtime() - started)
+                    + " len=" + p.size);
+            if (code != 200) throw new Exception(body.isEmpty() ? "HTTP " + code : body);
+            String id = new JSONObject(body).getString("id");
+            if (!UPLOAD_ID.matcher(id).matches()) throw new Exception("Bridge returned an invalid upload id.");
+            return id;
+        } finally {
+            c.disconnect();
+        }
+    }
+
+    /** Serves one renderer attachment image from the authenticated bridge GET. */
+    private WebResourceResponse loadAttachment(Host h, String sessionName, String blockId, String id) {
+        if (id == null || !UPLOAD_ID.matcher(id).matches()) return blockedAttachment();
+        HttpURLConnection c = null;
+        try {
+            String selector = sessionName + "/" + blockId;
+            c = (HttpURLConnection) new URL(h.baseUrl() + "/attachment?block="
+                    + URLEncoder.encode(selector, "UTF-8") + "&id=" + id).openConnection();
+            c.setRequestMethod("GET");
+            c.setConnectTimeout(4000);
+            c.setReadTimeout(20000);
+            authorize(c, h);
+            int code = c.getResponseCode();
+            String contentType = c.getContentType();
+            String mime = contentType == null ? "" : contentType.split(";")[0].trim().toLowerCase(java.util.Locale.ROOT);
+            if (code != 200 || !AttachmentSupport.isPreviewableImage(mime)) {
+                c.disconnect();
+                return blockedAttachment();
+            }
+            return new WebResourceResponse(mime, null, new DisconnectingInputStream(c.getInputStream(), c));
+        } catch (Exception e) {
+            if (c != null) c.disconnect();
+            return blockedAttachment();
+        }
+    }
+
+    private static WebResourceResponse blockedAttachment() {
+        return new WebResourceResponse("text/plain", "utf-8", new java.io.ByteArrayInputStream(new byte[0]));
+    }
+
+    private static String readAll(InputStream in, int cap) throws Exception {
+        if (in == null) return "";
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+            char[] buffer = new char[2048];
+            int read;
+            while ((read = reader.read(buffer)) > 0) {
+                if (sb.length() + read > cap) throw new Exception("Response exceeded " + cap + " characters — refused.");
+                sb.append(buffer, 0, read);
+            }
+            return sb.toString();
+        }
+    }
+
+    /** Keeps the connection alive for the stream's lifetime, then closes it. */
+    private static final class DisconnectingInputStream extends FilterInputStream {
+        private final HttpURLConnection connection;
+        private boolean closed;
+
+        DisconnectingInputStream(InputStream in, HttpURLConnection connection) {
+            super(in);
+            this.connection = connection;
+        }
+
+        @Override public void close() throws java.io.IOException {
+            try {
+                super.close();
+            } finally {
+                if (!closed) {
+                    closed = true;
+                    connection.disconnect();
+                }
+            }
+        }
     }
 
     // ---------- add / remove ----------
@@ -756,6 +1171,32 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == REQUEST_ATTACH) {
+            if (resultCode != RESULT_OK || data == null) return; // cancelled: draft and tray untouched
+            if (viewGen != pickerGen) {
+                status("Selection ignored — you moved to a different session.");
+                return;
+            }
+            ArrayList<Uri> uris = new ArrayList<>();
+            ClipData clip = data.getClipData();
+            if (clip != null) {
+                for (int i = 0; i < clip.getItemCount(); i++) {
+                    Uri uri = clip.getItemAt(i).getUri();
+                    if (uri != null) uris.add(uri);
+                }
+            } else if (data.getData() != null) {
+                uris.add(data.getData());
+            }
+            for (Uri uri : uris) {
+                try {
+                    getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                } catch (Exception ignored) {
+                    // Not all providers hand out persistable grants; the read grant still applies.
+                }
+            }
+            addPicked(uris);
+            return;
+        }
         if (!HostQrScanner.handleResult(this, requestCode, resultCode, data, io, host -> {
             try {
                 saveHost(host);
@@ -791,18 +1232,20 @@ public final class MainActivity extends Activity {
 
     private static final class HttpResult {
         final int code;
-        final String contentType;
         final String body;
-        HttpResult(int code, String contentType, String body) {
+        HttpResult(int code, String body) {
             this.code = code;
-            this.contentType = contentType;
             this.body = body;
         }
+    }
 
-        /** Older bridges answer /capture with text/plain; detect by content type. */
-        boolean isHtml() {
-            return contentType != null
-                    && contentType.toLowerCase(java.util.Locale.ROOT).contains("text/html");
+    /** Applies the bridge auth headers; bridge and Access credentials never follow a redirect. */
+    private static void authorize(HttpURLConnection c, Host h) {
+        c.setInstanceFollowRedirects(false);
+        c.setRequestProperty("Authorization", "Bearer " + h.token);
+        if (!h.accessId.isEmpty()) {
+            c.setRequestProperty("CF-Access-Client-Id", h.accessId);
+            c.setRequestProperty("CF-Access-Client-Secret", h.accessSecret);
         }
     }
 
@@ -811,15 +1254,10 @@ public final class MainActivity extends Activity {
         long started = SystemClock.elapsedRealtime();
         HttpURLConnection c = (HttpURLConnection) new URL(h.baseUrl() + path).openConnection();
         try {
-            c.setInstanceFollowRedirects(false); // Never send bridge or Access credentials to a redirect target.
             c.setRequestMethod(method);
             c.setConnectTimeout(4000);
             c.setReadTimeout(15000);
-            c.setRequestProperty("Authorization", "Bearer " + h.token);
-            if (!h.accessId.isEmpty()) {
-                c.setRequestProperty("CF-Access-Client-Id", h.accessId);
-                c.setRequestProperty("CF-Access-Client-Secret", h.accessSecret);
-            }
+            authorize(c, h);
             if (payload != null) {
                 c.setDoOutput(true);
                 c.setRequestProperty("Content-Type", "application/json");
@@ -828,19 +1266,10 @@ public final class MainActivity extends Activity {
                 }
             }
             int code = c.getResponseCode();
-            String contentType = c.getContentType();
-            java.io.InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
-            StringBuilder sb = new StringBuilder();
-            if (in != null) {
-                try (BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
-                    char[] buf = new char[2048];
-                    int n;
-                    while ((n = r.read(buf)) > 0 && sb.length() < 1_000_000) sb.append(buf, 0, n);
-                }
-            }
+            String body = readAll(code >= 400 ? c.getErrorStream() : c.getInputStream(), HTTP_BODY_LIMIT);
             Log.d(TAG, "http " + method + " " + path + " status=" + code
-                    + " ms=" + (SystemClock.elapsedRealtime() - started) + " len=" + sb.length());
-            return new HttpResult(code, contentType, sb.toString());
+                    + " ms=" + (SystemClock.elapsedRealtime() - started) + " len=" + body.length());
+            return new HttpResult(code, body);
         } catch (Exception e) {
             Log.w(TAG, "http " + method + " " + path + " failed: " + e.getClass().getSimpleName());
             throw e;
@@ -854,6 +1283,15 @@ public final class MainActivity extends Activity {
     private void stopTick() {
         viewGen++; // invalidate any in-flight capture for the previous view
         terminalKeys = null;
+        toolsExpanded = false;
+        attachmentTray = null;
+        attachmentTrayScroll = null;
+        draft = null;
+        sendButton = null;
+        attachButton = null;
+        sendBusy = false;
+        pickerGen = -1;
+        pendingAttachments.clear();
         if (refreshTick != null) { ui.removeCallbacks(refreshTick); refreshTick = null; }
         InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
         if (imm != null) imm.hideSoftInputFromWindow(getWindow().getDecorView().getWindowToken(), 0);

@@ -97,7 +97,7 @@ public final class AndroidCheck {
         System.out.println("Paper terminal text/highlight contrast checks passed.");
     }
 
-    /** Conversation captures: escaping, markdown rendering, fixed role classes. */
+    /** Conversation captures: escaping, markdown, role/activity markup and attachment safety. */
     private static void checkTerminalConversation() throws Exception {
         Method render = TerminalView.class.getDeclaredMethod("conversationHtml", JSONObject.class);
         render.setAccessible(true);
@@ -108,25 +108,90 @@ public final class AndroidCheck {
         messages.put(new JSONObject().put("role", "assistant").put("format", "markdown")
                 .put("text", "Use **bold**, `code`, [bad](javascript:alert(1)) and "
                         + "[ok](https://example.com/x)\n\n![diagram](https://example.com/p.png)\n"));
-        messages.put(new JSONObject().put("role", "tool").put("name", "read <x>").put("format", "text")
-                .put("id", "x\" onclick=\"alert(1)").put("text", "line one\nline two <b>bold</b>"));
         messages.put(new JSONObject().put("role", "weird<script>").put("format", "text")
                 .put("text", "unknown role body"));
-        String html = (String) render.invoke(null, new JSONObject().put("messages", messages));
+        messages.put(new JSONObject().put("role", "tool").put("name", "read <x>").put("format", "text")
+                .put("id", "x\" onclick=\"alert(1)").put("text", "line one\nline two <b>bold</b>"));
+        messages.put(new JSONObject().put("role", "tool").put("name", "bash").put("format", "text")
+                .put("id", "tool-bash").put("text", "make: *** [all] Error 1"));
+        messages.put(new JSONObject().put("role", "context").put("format", "text")
+                .put("id", "ctx-1").put("text", "injected context body"));
+        JSONArray attachments = new JSONArray();
+        attachments.put(new JSONObject().put("id", "0123456789abcdef0123456789abcdef")
+                .put("name", "shot\"><script>alert(1)</script>.png").put("mime", "image/png")
+                .put("size", 2048));
+        attachments.put(new JSONObject().put("id", "ffffffffffffffffffffffffffffffff")
+                .put("name", "vector.svg").put("mime", "image/svg+xml").put("size", 900));
+        attachments.put(new JSONObject().put("id", "../../etc/passwd").put("name", "evil.sh")
+                .put("mime", "application/x-sh").put("size", 10));
+        attachments.put(new JSONObject().put("id", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .put("name", "payload.apk").put("mime", "application/vnd.android.package-archive")
+                .put("size", 5242880));
+        messages.put(new JSONObject().put("role", "user").put("format", "text")
+                .put("text", "here is the shot").put("attachments", attachments));
+        JSONArray imageOnly = new JSONArray();
+        imageOnly.put(new JSONObject().put("id", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .put("name", "diagram.png").put("mime", "image/png").put("size", 3072));
+        messages.put(new JSONObject().put("role", "user").put("format", "text")
+                .put("text", "").put("attachments", imageOnly));
 
-        for (String forbidden : new String[] {"<script", "<body", "<files>", "javascript:", "onload=x>", "\" onclick="}) {
+        String html = (String) render.invoke(null, new JSONObject().put("messages", messages));
+        String shifted = (String) render.invoke(null,
+                new JSONObject().put("messages", messages).put("start", 500));
+        if (!html.equals(shifted)) throw new AssertionError("Conversation keys depend on page offsets");
+
+        for (String forbidden : new String[] {"<script", "<body", "<files>", "javascript:", "onload=x>",
+                "\" onclick=", "../../etc/passwd", "evil.sh"}) {
             if (html.contains(forbidden)) throw new AssertionError("Conversation markup leaked " + forbidden);
         }
         for (String required : new String[] {"&lt;body onload=x&gt;", "&lt;files&gt;a/b.txt&lt;/files&gt;",
                 "<h1", "<strong>bold</strong>", "<code>code</code>", "int a = 1;",
                 "href=\"https://example.com/x\"", "alt=\"diagram\"",
-                "line two &lt;b&gt;bold&lt;/b&gt;", "weird&lt;script&gt;"}) {
+                "line two &lt;b&gt;bold&lt;/b&gt;", "weird&lt;script&gt;",
+                "injected context body", "here is the shot"}) {
             if (!html.contains(required)) throw new AssertionError("Conversation markup missing " + required);
         }
-        if (html.contains("<details open")) throw new AssertionError("Tool card not collapsed");
         if (html.contains("# Heading")) throw new AssertionError("Markdown left as source text");
+
+        java.util.regex.Matcher groups = java.util.regex.Pattern
+                .compile("<details class=\"activity\" data-key=\"([^\"]*)\">").matcher(html);
+        int found = 0;
+        while (groups.find()) found++;
+        if (found != 1) throw new AssertionError("Folded rows did not collapse into one Activity group");
+        if (html.split("<div class=\"act ", -1).length - 1 != 4)
+            throw new AssertionError("Activity group lost a folded row");
+        if (!html.contains("make: *** [all] Error 1"))
+            throw new AssertionError("Folded technical output was dropped");
+        java.util.regex.Matcher details = java.util.regex.Pattern
+                .compile("(?s)<details[^>]*>").matcher(html.replaceAll("\"[^\"]*\"", "\"\""));
+        while (details.find()) {
+            if (details.group().contains("open"))
+                throw new AssertionError("Activity group carried an open attribute");
+        }
+
+        String imageId = "0123456789abcdef0123456789abcdef";
+        if (!html.contains("<img class=\"attach-img\" src=\"https://attachments.tern.invalid/" + imageId
+                + "\" alt=\"shot&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;.png\">"))
+            throw new AssertionError("Raster attachment preview missing or unsafe");
+        if (html.contains("attachments.tern.invalid/ffffffffffffffffffffffffffffffff")
+                || html.contains("attachments.tern.invalid/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+            throw new AssertionError("Non-raster attachment rendered as an image");
+        if (!html.contains("<span class=\"attach-name\">vector.svg</span>")
+                || !html.contains("image/svg+xml \u00b7 900 B"))
+            throw new AssertionError("File card lost its name, type or size");
+        if (!html.contains("<span class=\"attach-name\">payload.apk</span>")
+                || !html.contains("application/vnd.android.package-archive \u00b7 5.0 MB"))
+            throw new AssertionError("Binary attachment lost its name, type or size");
+        if (!html.contains("<div class=\"msg user\"><div class=\"who\">You</div><div class=\"attach\">"
+                + "<img class=\"attach-img\" src=\"https://attachments.tern.invalid/"
+                + "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" alt=\"diagram.png\">"))
+            throw new AssertionError("Image-only send lost its preview or gained an empty bubble");
+        if (html.contains("<div class=\"body\"></div>"))
+            throw new AssertionError("Empty message body rendered");
+
         java.util.Set<String> allowed = new java.util.HashSet<>(java.util.Arrays.asList(
-                "msg", "user", "assistant", "tool", "context", "other", "who", "name", "body", "plain"));
+                "msg", "user", "assistant", "tool", "context", "other", "who", "name", "body", "plain",
+                "activity", "act", "attach", "attach-img", "attach-file", "attach-name", "attach-meta"));
         java.util.regex.Matcher classes =
                 java.util.regex.Pattern.compile("class=\"([^\"]*)\"").matcher(html);
         while (classes.find()) {
@@ -136,7 +201,7 @@ public final class AndroidCheck {
                 throw new AssertionError("Payload text reached a class attribute: " + token);
             }
         }
-        System.out.println("Conversation card escaping, markdown and role-class checks passed.");
+        System.out.println("Conversation role, markup and attachment-safety checks passed.");
     }
 
     private static void expect(Method method, Signature[] a, Signature[] b, boolean expected) throws Exception {

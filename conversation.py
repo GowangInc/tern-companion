@@ -18,13 +18,21 @@ A missing path raises `FileNotFoundError`. Complete (newline-terminated)
 records are decoded and parsed strictly, so a malformed terminated record or a
 missing/blank session header raises `ValueError`; only an unterminated final
 record is treated as an interrupted append and ignored.
+
+`read_session_header` answers only the canonical identity question — which
+session, if any, a candidate file is — and reads just the leading records, so
+the bridge can confirm a pane's own open transcript without loading a whole
+session.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-__all__ = ["read_conversation"]
+__all__ = ["read_conversation", "read_session_header"]
+
+HEADER_RECORD_LIMIT = 64
+HEADER_LINE_BYTES = 1024 * 1024
 
 
 def _text_of(content) -> str:
@@ -53,6 +61,35 @@ def _message(entry_id: str, role: str, text: str, fmt: str, name=None) -> dict:
     if name is not None:
         message["name"] = name
     return message
+
+
+def _session_id(record) -> str | None:
+    """The id of a canonical session header record, or None when it is not one."""
+    if not isinstance(record, dict) or record.get("type") != "session":
+        return None
+    header_id = record.get("id")
+    return header_id if isinstance(header_id, str) and header_id else None
+
+
+def read_session_header(path: Path) -> str | None:
+    """The session id a file's canonical header declares, or None when it has none.
+
+    Only the leading records are read, and an unparsable line is skipped rather
+    than fatal: this answers "is this OMP's own transcript, and for which
+    session?" for a file another process merely holds open.
+    """
+    with Path(path).open("rb") as stream:
+        for _ in range(HEADER_RECORD_LIMIT):
+            line = stream.readline(HEADER_LINE_BYTES)
+            if not line:
+                break
+            try:
+                header_id = _session_id(json.loads(line.decode("utf-8")))
+            except (UnicodeError, ValueError):
+                continue
+            if header_id:
+                return header_id
+    return None
 
 
 def _read_entries(path: Path) -> tuple[str, list[dict]]:
@@ -87,8 +124,8 @@ def _read_entries(path: Path) -> tuple[str, list[dict]]:
             continue
         if kind == "session":
             if not session:
-                header_id = record.get("id")
-                if not isinstance(header_id, str) or not header_id:
+                header_id = _session_id(record)
+                if header_id is None:
                     raise ValueError("session header has no id")
                 session = header_id
             continue

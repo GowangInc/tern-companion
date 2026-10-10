@@ -13,6 +13,7 @@
 !/checks/
 !/tern_bridge.py
 !/conversation.py
+!/phone_uploads.py
 !/tern_qr.py
 !/requirements-qr.txt
 !/gradle/wrapper/
