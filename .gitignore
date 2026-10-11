@@ -11,6 +11,11 @@
 !/gradle/
 !/app/
 !/checks/
+!/screenshots/
+/screenshots/*
+!/screenshots/chat.png
+!/screenshots/full-size.png
+!/screenshots/zoom.png
 !/tern_bridge.py
 !/conversation.py
 !/phone_uploads.py

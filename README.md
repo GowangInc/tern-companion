@@ -16,6 +16,16 @@ The Android app talks to `tern_bridge.py` on your computer. The bridge uses Tern
 - Open **Tools** for Enter, Ctrl+C, Escape, Tab, arrow keys and **Ctrl+P** for compatible model cycling.
 - Check GitHub for stable updates, download the APK and open Android’s installer for confirmation.
 
+## Screenshots
+
+Chat and composer, full-screen original image, and pinch-zoomed detail. The chat screenshot is cropped to omit computer/session identifiers. No addresses, credentials, file paths or pairing QR codes are shown.
+
+<p>
+  <img src="screenshots/chat.png" width="200" alt="Chat with an image preview, collapsed activity and message composer">
+  <img src="screenshots/full-size.png" width="200" alt="Original image open full-screen">
+  <img src="screenshots/zoom.png" width="200" alt="Full-resolution image detail after pinch zoom">
+</p>
+
 ## Requirements
 
 - Android 8.0 or newer. A camera is optional because saved QR images work offline.
