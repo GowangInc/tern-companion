@@ -5,7 +5,8 @@ Run with `python3 checks/test_conversation_media.py` or via the unittest
 discovery in checks/run_all.py. Covers the consumer-visible boundaries of
 conversation.py + phone_uploads.py media handling: magic-byte typing, stable
 content ids, active-branch visibility gating, native OMP image/blob/fileMention
-shapes, Markdown image-link rewriting, and traversal/malformed-input safety.
+shapes, Markdown image-link rewriting, explicit `MEDIA:` markers, inline
+`data:` URL images, and traversal/malformed-input safety.
 All fixtures are synthetic; no private transcript or credential data is used.
 """
 import base64
@@ -184,7 +185,7 @@ class MediaStoreChecks(unittest.TestCase):
 
 
 class ConversationMediaChecks(unittest.TestCase):
-    """read_conversation staging of native image shapes and Markdown links."""
+    """read_conversation staging of native image shapes and generated image forms."""
 
     SESSION = "media-conversation-checks"
 
@@ -390,6 +391,130 @@ class ConversationMediaChecks(unittest.TestCase):
                          [1791678610000, 1791678610000])
         self.assertNotIn("timestamp", payload["messages"][-1])
         self.assertEqual(payload["messages"][-1]["text"], "legacy message")
+
+    def test_assistant_media_marker_stages_generated_image(self):
+        generated = Path(self.work.name) / "shot.png"
+        generated.write_bytes(PNG)
+        spaced = Path(self.work.name) / "shared pictures"
+        spaced.mkdir()
+        wrapped = spaced / "wrapped.jpg"
+        wrapped.write_bytes(JPEG)
+        (Path(self.work.name) / "rel.gif").write_bytes(GIF)
+        (Path(self.work.name) / "only.webp").write_bytes(WEBP)
+        payload = self.capture([
+            self.message("a1", None, {"role": "assistant", "content": [
+                {"type": "text", "text": "Here it is: MEDIA:" + str(generated)}]}),
+            self.message("a2", "a1", {"role": "assistant", "content": [
+                {"type": "text", "text": "Wrapped: MEDIA:<" + str(wrapped) + ">"}]}),
+            self.message("a3", "a2", {"role": "assistant", "content": [
+                {"type": "text", "text": "Relative MEDIA:rel.gif done."}]}),
+            self.message("a4", "a3", {"role": "assistant", "content": [
+                {"type": "text", "text": "MEDIA:only.webp"}]}),
+        ])
+        first, second, third, fourth = payload["messages"]
+        self.assertEqual(first["text"], "Here it is: ")
+        self.assertEqual(second["text"], "Wrapped: ")
+        self.assertEqual(third["text"], "Relative  done.")
+        self.assertEqual(fourth["text"], "[image]")
+        self.assertEqual(first["attachments"], [
+            {"id": media_id(PNG), "name": "shot.png", "mime": "image/png", "size": len(PNG)}])
+        self.assertEqual(second["attachments"], [
+            {"id": media_id(JPEG), "name": "wrapped.jpg",
+             "mime": "image/jpeg", "size": len(JPEG)}])
+        self.assertEqual(third["attachments"], [
+            {"id": media_id(GIF), "name": "rel.gif", "mime": "image/gif", "size": len(GIF)}])
+        self.assertEqual(fourth["attachments"], [
+            {"id": media_id(WEBP), "name": "only.webp",
+             "mime": "image/webp", "size": len(WEBP)}])
+        # The capture publishes the referenced ids, so each is served byte-exact.
+        self.assertEqual(phone_uploads.metadata(self.SESSION, media_id(PNG)), first["attachments"][0])
+        self.assertEqual(phone_uploads.original(self.SESSION, media_id(PNG)).read_bytes(), PNG)
+        self.assertEqual(phone_uploads.original(self.SESSION, media_id(JPEG)).read_bytes(), JPEG)
+        self.assertEqual(phone_uploads.original(self.SESSION, media_id(GIF)).read_bytes(), GIF)
+        self.assertEqual(phone_uploads.original(self.SESSION, media_id(WEBP)).read_bytes(), WEBP)
+
+    def test_assistant_inline_data_url_image_is_staged(self):
+        encoded = base64.b64encode(JPEG).decode()
+        payload = self.capture([
+            self.message("a1", None, {"role": "assistant", "content": [
+                {"type": "text",
+                 "text": "![Anime scene: repairing a biological computer]"
+                         "(data:image/jpeg;base64," + encoded + ")"}]}),
+        ])
+        message = payload["messages"][0]
+        self.assertEqual(message["text"], "Anime scene: repairing a biological computer")
+        self.assertEqual(message["attachments"], [
+            {"id": media_id(JPEG), "name": "image",
+             "mime": "image/jpeg", "size": len(JPEG)}])
+        self.assertNotIn("base64", message["text"])
+        self.assertEqual(phone_uploads.metadata(self.SESSION, media_id(JPEG)),
+                         message["attachments"][0])
+        self.assertEqual(phone_uploads.original(self.SESSION, media_id(JPEG)).read_bytes(), JPEG)
+
+    def test_generated_image_forms_inside_code_are_not_staged(self):
+        marker = "MEDIA:" + str(Path(self.work.name) / "code.png")
+        data_url = "![x](data:image/png;base64," + base64.b64encode(PNG).decode() + ")"
+        text = "\n".join([
+            "```",
+            marker,
+            data_url,
+            "```",
+            "Inline `" + marker + "` stays.",
+            "Also `" + data_url + "` stays.",
+        ])
+        payload = self.capture([
+            self.message("a1", None, {"role": "assistant",
+                                      "content": [{"type": "text", "text": text}]}),
+        ])
+        self.assertEqual(payload["messages"][0]["text"], text)
+        self.assertEqual(self.attachments_of(payload, "assistant"), [])
+
+    def test_unstageable_generated_image_forms_stay_verbatim(self):
+        (Path(self.work.name) / "notes.txt").write_bytes(b"not an image")
+        lines = [
+            "MEDIA:https://example.com/i.png",
+            "MEDIA:" + str(Path(self.work.name) / "absent.png"),
+            "MEDIA:" + str(Path(self.work.name) / "notes.txt"),
+            "![remote](https://example.com/i.png)",
+            "![bad](data:image/png;base64,!!!not_base64!!!)",
+            "![wrong](data:image/png;base64," + base64.b64encode(b"plain text").decode() + ")",
+            "![nopayload](data:image/png)",
+        ]
+        payload = self.capture([
+            self.message("a1", None, {"role": "assistant",
+                                      "content": [{"type": "text", "text": "\n".join(lines)}]}),
+        ])
+        self.assertEqual(payload["messages"][0]["text"], "\n".join(lines))
+        self.assertEqual(self.attachments_of(payload, "assistant"), [])
+        self.assertEqual(list(self.root.glob("*")), [])
+        oversize = "![big](data:image/png;base64," + base64.b64encode(PNG).decode() + ")"
+        with patch.object(phone_uploads, "MAX_UPLOAD_BYTES", 16):
+            payload = self.capture([
+                self.message("a1", None, {"role": "assistant",
+                                          "content": [{"type": "text", "text": oversize}]}),
+            ])
+        self.assertEqual(payload["messages"][0]["text"], oversize)
+        self.assertEqual(self.attachments_of(payload, "assistant"), [])
+        self.assertEqual(list(self.root.glob("*")), [])
+
+    def test_abandoned_branch_generated_image_is_never_servable(self):
+        abandoned = Path(self.work.name) / "abandoned.png"
+        abandoned.write_bytes(JPEG)
+        active = Path(self.work.name) / "active.png"
+        active.write_bytes(PNG)
+        payload = self.capture([
+            self.message("u1", None, {"role": "user", "content": "base"}),
+            self.message("old", "u1", {"role": "assistant", "content": [
+                {"type": "text", "text": "MEDIA:" + str(abandoned)}]}),
+            self.message("u2", "u1", {"role": "user", "content": "rewound"}),
+            self.message("new", "u2", {"role": "assistant", "content": [
+                {"type": "text", "text": "MEDIA:" + str(active)}]}),
+        ])
+        self.assertIsNone(phone_uploads.metadata(self.SESSION, media_id(JPEG)))
+        self.assertIsNone(phone_uploads.original(self.SESSION, media_id(JPEG)))
+        self.assertEqual(self.attachments_of(payload, "assistant"), [
+            {"id": media_id(PNG), "name": "active.png", "mime": "image/png", "size": len(PNG)}])
+        self.assertEqual(phone_uploads.original(self.SESSION, media_id(PNG)).read_bytes(), PNG)
 
 
 

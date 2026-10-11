@@ -767,18 +767,38 @@ class OmpSessionChecks(unittest.TestCase):
         path.write_text("".join(line + "\n" for line in lines) + body, encoding="utf-8")
         return path
 
-    def resolve(self, open_paths, *, name="18.8.7", argv=("omp",), pid=4242, exe=""):
+    def resolve(self, open_paths, *, name="18.8.7", argv=("omp",), pid=4242, exe="",
+                stat_ids=None, group=(), proc_argv=None):
         """Resolve block 42 against a synthetic foreground process and file table."""
         foreground = {"pid": pid, "name": name, "argv": list(argv), "cwd": "/tmp"}
         if open_paths is None:
             # A non-OMP program's file table must never even be inspected.
             paths = patch.object(bridge, "_open_paths",
                                  side_effect=AssertionError("a non-OMP process has no OMP transcript"))
+        elif isinstance(open_paths, dict):
+            # Keyed by pid: reading any other process's file table fails the test.
+            tables = {key: set(value) for key, value in open_paths.items()}
+
+            def open_of(queried):
+                if queried not in tables:
+                    raise AssertionError(f"unexpected file-table read for pid {queried}")
+                return tables[queried]
+
+            paths = patch.object(bridge, "_open_paths", side_effect=open_of)
         else:
             paths = patch.object(bridge, "_open_paths", return_value=set(open_paths))
+        exe_of = (lambda queried: exe.get(queried, "")) if isinstance(exe, dict) \
+            else (lambda queried: exe)
+        argv_of = lambda queried: list((proc_argv or {}).get(queried, ()))
+        stat_of = (lambda queried: stat_ids.get(queried)) if isinstance(stat_ids, dict) \
+            else (lambda queried: stat_ids)
         with patch.object(bridge, "run_tern",
                           return_value=(0, json.dumps({"foreground": foreground}))), \
-                patch.object(bridge, "_exe_path", return_value=exe), paths:
+                patch.object(bridge, "_exe_path", side_effect=exe_of), \
+                patch.object(bridge, "_proc_stat_ids", side_effect=stat_of), \
+                patch.object(bridge, "_group_pids", return_value=list(group)), \
+                patch.object(bridge, "_proc_argv", side_effect=argv_of), \
+                paths:
             return bridge.omp_session("42")
 
     def test_version_renamed_omp_resolves_its_own_transcript(self):
@@ -825,6 +845,50 @@ class OmpSessionChecks(unittest.TestCase):
         second = self.transcript(self.OTHER)
         with self.assertRaises(RuntimeError):
             self.resolve({first, second})
+
+    def test_shell_foreground_resolves_omp_child_in_its_terminal_group(self):
+        """The observed case: bash is foreground, OMP its child in the same group."""
+        path = self.transcript()
+        resolved = self.resolve({200: {path}}, name="bash", argv=("/bin/bash",), pid=100,
+                                stat_ids={100: (100, 100)}, group=[100, 200],
+                                exe={200: "/home/nicholas/.omp/bin/omp"})
+        self.assertEqual(resolved, path)
+
+    def test_group_omp_identified_by_kernel_argv_when_exe_is_unreadable(self):
+        path = self.transcript()
+        resolved = self.resolve({200: {path}}, name="bash", argv=("/bin/bash",), pid=100,
+                                stat_ids={100: (100, 100)}, group=[100, 200],
+                                exe={}, proc_argv={200: ("omp",)})
+        self.assertEqual(resolved, path)
+
+    def test_background_process_group_never_qualifies(self):
+        """A group that does not hold the terminal is never even scanned."""
+        foreground = {"pid": 100, "name": "bash", "argv": ["/bin/bash"], "cwd": "/tmp"}
+        with patch.object(bridge, "run_tern",
+                          return_value=(0, json.dumps({"foreground": foreground}))), \
+                patch.object(bridge, "_exe_path", return_value=""), \
+                patch.object(bridge, "_proc_stat_ids", side_effect=lambda queried: (100, 400)), \
+                patch.object(bridge, "_group_pids",
+                             side_effect=AssertionError("a background group is never scanned")), \
+                patch.object(bridge, "_open_paths",
+                             side_effect=AssertionError("a non-OMP process has no OMP transcript")):
+            self.assertIsNone(bridge.omp_session("42"))
+
+    def test_unrelated_omp_outside_the_foreground_group_never_qualifies(self):
+        """An OMP in another process group is never listed, so never resolved."""
+        self.assertIsNone(self.resolve(None, name="bash", argv=("/bin/bash",), pid=100,
+                                       stat_ids={100: (100, 100)}, group=[100]))
+
+    def test_editor_foreground_in_its_own_terminal_group_stays_terminal(self):
+        self.assertIsNone(self.resolve(None, name="vim", argv=("vim",), pid=600,
+                                       stat_ids={600: (600, 600)}, group=[600]))
+
+    def test_two_omp_members_in_one_group_are_refused_as_ambiguous(self):
+        with self.assertRaises(RuntimeError):
+            self.resolve(None, name="bash", argv=("/bin/bash",), pid=100,
+                         stat_ids={100: (100, 100)}, group=[100, 200, 300],
+                         exe={200: "/home/nicholas/.omp/bin/omp",
+                              300: "/home/nicholas/.omp/bin/omp"})
 
 
 class UploadStoreChecks(unittest.TestCase):

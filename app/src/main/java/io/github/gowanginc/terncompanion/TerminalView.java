@@ -1,6 +1,7 @@
 package io.github.gowanginc.terncompanion;
 
 import android.annotation.SuppressLint;
+import android.app.Dialog;
 import android.content.Context;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
@@ -11,6 +12,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.util.AttributeSet;
 import android.view.Gravity;
+import android.view.ViewGroup;
 import android.view.MotionEvent;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -19,6 +21,8 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 
 import androidx.annotation.NonNull;
 
@@ -49,8 +53,8 @@ import java.util.regex.Pattern;
  * Read-only terminal pane for Tern captures: a built-in WebView locked to a
  * local inert document. HTML captures from the bridge are sanitized to a
  * pre/span/br whitelist with a short inline-style allow-list before they reach
- * the DOM; no navigation, no network, no bridges. Older bridges that still
- * answer with plain text are shown escaped through the same pane.
+ * the DOM; no external navigation, no network, no bridges. Tapping a rendered
+ * attachment opens its original in a locked, zoomable full-screen image viewer.
  *
  * Conversation captures are rendered locally as readable chat: system prose type
  * for You/Assistant turns (user bubbles right-aligned on muted sage, assistant
@@ -199,6 +203,8 @@ public final class TerminalView extends FrameLayout {
             + "#t.convo .attach{margin-top:6px;max-width:100%;min-width:0;}"
             + "#t.convo .attach-img{display:block;max-width:100%;max-height:22em;width:auto;"
             + "height:auto;border-radius:8px;background:#e9e5db;}"
+            + "#t.convo .attach-open{display:block;max-width:100%;width:fit-content;}"
+            + "#t.convo .attach-open:focus-visible{outline:2px solid #17634e;}"
             + "#t.convo .attach-file{display:inline-flex;flex-direction:column;gap:2px;"
             + "background:#efece2;border:1px solid #ded8ca;border-radius:8px;padding:6px 10px;"
             + "max-width:100%;}"
@@ -247,6 +253,7 @@ public final class TerminalView extends FrameLayout {
     private AttachmentLoader attachmentLoader;
     /** Ids rendered as images by the newest conversation; the loader gate for {@link #ATTACHMENT_HOST}. */
     private volatile Set<String> renderedAttachmentIds = Collections.emptySet();
+    private Dialog imageDialog;
     private boolean loaded;
     private String lastFragment = "";
     private String lastClass = "";
@@ -309,29 +316,24 @@ public final class TerminalView extends FrameLayout {
 
         webView.setWebViewClient(new WebViewClient() {
             @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                return true; // inert surface: never navigate, not even to the request URL.
+                if (request.isForMainFrame()) openImage(request.getUrl());
+                return true; // never navigate the conversation itself.
             }
 
             @Override public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                openImage(Uri.parse(url));
                 return true;
             }
 
             @Override public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                 Uri url = request.getUrl();
-                String scheme = url.getScheme();
-                if ("https".equals(scheme) && ATTACHMENT_HOST.equals(url.getHost())) {
-                    // Only ids this pane just rendered as images may reach the loader.
-                    AttachmentLoader loader = attachmentLoader;
-                    String path = url.getPath();
-                    if (loader != null && path != null) {
-                        Matcher attachment = ATTACHMENT_PATH.matcher(path);
-                        if (attachment.matches() && renderedAttachmentIds.contains(attachment.group(1))) {
-                            WebResourceResponse response = loader.load(attachment.group(1));
-                            if (response != null) return response;
-                        }
-                    }
-                    return blocked();
+                String id = attachmentId(url, renderedAttachmentIds);
+                AttachmentLoader loader = attachmentLoader;
+                if (id != null && loader != null) {
+                    WebResourceResponse response = loader.load(id);
+                    if (response != null) return response;
                 }
+                String scheme = url.getScheme();
                 if ("http".equals(scheme) || "https".equals(scheme)
                         || "file".equals(scheme) || "content".equals(scheme)) {
                     return blocked(); // every ordinary fetch stays inert.
@@ -370,6 +372,91 @@ public final class TerminalView extends FrameLayout {
     /** Authenticated byte source for the attachment images this pane renders. */
     public void setAttachmentLoader(AttachmentLoader loader) {
         attachmentLoader = loader;
+    }
+
+    /** A canonical, currently rendered raster id; never an arbitrary navigable URL. */
+    private static String attachmentId(Uri url, Set<String> allowed) {
+        if (!"https".equals(url.getScheme()) || !ATTACHMENT_HOST.equals(url.getHost())
+                || url.getUserInfo() != null || url.getPort() != -1
+                || url.getQuery() != null || url.getFragment() != null) return null;
+        String path = url.getPath();
+        if (path == null) return null;
+        Matcher match = ATTACHMENT_PATH.matcher(path);
+        return match.matches() && allowed.contains(match.group(1)) ? match.group(1) : null;
+    }
+
+    /** Uses WebView's native image-document zoom/pan; no bitmap copy or resizing. */
+    private void openImage(Uri url) {
+        Set<String> allowed = renderedAttachmentIds;
+        String id = attachmentId(url, allowed);
+        AttachmentLoader loader = attachmentLoader;
+        if (id == null || loader == null) return;
+        if (imageDialog != null) imageDialog.dismiss();
+        Dialog dialog = new Dialog(getContext(), android.R.style.Theme_Material_Light_NoActionBar_Fullscreen);
+        LinearLayout page = new LinearLayout(getContext());
+        page.setOrientation(LinearLayout.VERTICAL);
+        page.setBackgroundColor(Color.parseColor(BG));
+        LinearLayout header = new LinearLayout(getContext());
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        Button close = new Button(getContext());
+        close.setText("‹");
+        close.setTextSize(24);
+        close.setContentDescription("Close image viewer");
+        close.setOnClickListener(v -> dialog.dismiss());
+        header.addView(close, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        TextView hint = new TextView(getContext());
+        hint.setText("Full-size image · pinch to zoom");
+        hint.setTextColor(Color.parseColor(INK));
+        hint.setTextSize(16);
+        header.addView(hint, new LinearLayout.LayoutParams(0, -2, 1));
+        page.addView(header, new LinearLayout.LayoutParams(-1, -2));
+        WebView image = new WebView(getContext());
+        image.setContentDescription("Original image. Pinch to zoom and drag to pan.");
+        image.setBackgroundColor(Color.parseColor(BG));
+        WebSettings settings = image.getSettings();
+        settings.setJavaScriptEnabled(false);
+        settings.setAllowFileAccess(false);
+        settings.setAllowContentAccess(false);
+        settings.setGeolocationEnabled(false);
+        settings.setSupportZoom(true);
+        settings.setBuiltInZoomControls(true);
+        settings.setDisplayZoomControls(false);
+        settings.setUseWideViewPort(true);
+        settings.setLoadWithOverviewMode(true);
+        settings.setSafeBrowsingEnabled(true);
+        image.setWebViewClient(new WebViewClient() {
+            @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                return true;
+            }
+            @Override public boolean shouldOverrideUrlLoading(WebView view, String target) {
+                return true;
+            }
+            @Override public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                if (id.equals(attachmentId(request.getUrl(), allowed))) {
+                    WebResourceResponse response = loader.load(id);
+                    if (response != null && RASTER_MIME.contains(response.getMimeType())) return response;
+                    view.post(() -> hint.setText("Image unavailable · close and refresh chat"));
+                }
+                return blocked();
+            }
+        });
+        page.addView(image, new LinearLayout.LayoutParams(-1, 0, 1));
+        dialog.setContentView(page);
+        dialog.setOnDismissListener(ignored -> {
+            image.stopLoading();
+            page.removeView(image);
+            image.destroy();
+            if (imageDialog == dialog) imageDialog = null;
+        });
+        imageDialog = dialog;
+        dialog.show();
+        dialog.getWindow().setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+        image.loadUrl("https://" + ATTACHMENT_HOST + "/" + id);
+    }
+
+    @Override protected void onDetachedFromWindow() {
+        if (imageDialog != null) imageDialog.dismiss();
+        super.onDetachedFromWindow();
     }
 
     /** Lets a paged conversation return to the live page instead of its local tail. */
@@ -534,8 +621,11 @@ public final class TerminalView extends FrameLayout {
             String mime = safeMime(attachment.optString("mime", ""));
             out.append("<div class=\"attach\">");
             if (RASTER_MIME.contains(mime)) {
-                out.append("<img class=\"attach-img\" src=\"https://").append(ATTACHMENT_HOST)
-                        .append('/').append(id).append("\" alt=\"").append(attr(name)).append("\">");
+                out.append("<a class=\"attach-open\" href=\"https://").append(ATTACHMENT_HOST)
+                        .append('/').append(id).append("\" aria-label=\"Open full-size image: ")
+                        .append(attr(name)).append("\">")
+                        .append("<img class=\"attach-img\" src=\"https://").append(ATTACHMENT_HOST)
+                        .append('/').append(id).append("\" alt=\"").append(attr(name)).append("\"></a>");
             } else {
                 out.append("<div class=\"attach-file\"><span class=\"attach-name\">")
                         .append(escape(name)).append("</span><span class=\"attach-meta\">")

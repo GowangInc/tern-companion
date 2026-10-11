@@ -139,16 +139,91 @@ def _omp_program(foreground: dict, pid: int | None) -> bool:
     return _is_omp_executable(_exe_path(pid) if pid is not None else None)
 
 
+def _proc_stat_ids(pid: int) -> tuple[int, int] | None:
+    """One process's (process group, terminal foreground group), or None off Linux."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    # comm sits inside the last parenthesised field and may itself hold spaces.
+    fields = stat.rsplit(")", 1)[-1].split()
+    try:
+        return int(fields[2]), int(fields[5])  # pgrp, tpgid
+    except (IndexError, ValueError):
+        return None
+
+
+def _proc_argv(pid: int) -> list[str]:
+    """One process's argv exactly as the kernel reports it, or [] when unreadable."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+
+
+def _group_pids(pgid: int) -> list[int]:
+    """Every live process in one process group, from the kernel's own /proc table."""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    members = []
+    for entry in entries:
+        if entry.isdigit():
+            ids = _proc_stat_ids(int(entry))
+            if ids is not None and ids[0] == pgid:
+                members.append(int(entry))
+    return members
+
+
+def _omp_kernel_identity(pid: int) -> bool:
+    """Whether one live process is OMP, from the kernel's records, never held files."""
+    if _is_omp_executable(_exe_path(pid)):
+        return True
+    argv = _proc_argv(pid)
+    return bool(argv) and Path(argv[0]).name.lower() in OMP_PROCESS_NAMES
+
+
+def _foreground_group_omp(pid: int) -> int | None:
+    """The single OMP inside the pane's terminal-foreground process group, if any.
+
+    A shell reports itself as the pane's foreground program while OMP runs as a
+    child of that shell inside the same foreground process group. The group
+    qualifies only while it actually holds the terminal (pgrp == tpgid), so a
+    background or unrelated OMP never does. More than one eligible OMP is
+    ambiguous and fails loudly.
+    """
+    ids = _proc_stat_ids(pid)
+    if ids is None:
+        return None
+    pgid, tpgid = ids
+    if pgid <= 0 or pgid != tpgid:
+        return None
+    members = [member for member in _group_pids(pgid)
+               if member != pid and _omp_kernel_identity(member)]
+    if len(members) > 1:
+        raise RuntimeError("the pane's foreground group holds multiple OMP processes")
+    return members[0] if members else None
+
+
 def _omp_pid(foreground: dict) -> int | None:
-    """The pane's OMP process id, or None when its foreground program is not OMP."""
+    """The pane's OMP process id, or None when the pane is not running OMP.
+
+    OMP qualifies as the pane's own foreground program or as the single OMP
+    inside that program's terminal-foreground process group (a shell that
+    launched it); anything less keeps the pane's ordinary terminal capture.
+    """
     pid = foreground.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         pid = None
-    if not _omp_program(foreground, pid):
-        return None
+    if _omp_program(foreground, pid):
+        if pid is None:
+            raise RuntimeError("OMP process identity unavailable")
+        return pid
     if pid is None:
-        raise RuntimeError("OMP process identity unavailable")
-    return pid
+        return None
+    return _foreground_group_omp(pid)
 
 
 def _session_of(path: Path) -> str:
@@ -172,9 +247,11 @@ def _transcript_session(path: Path) -> str | None:
 def omp_session(block: str) -> Path | None:
     """Resolve the pane's actual foreground OMP transcript, never a newest file.
 
-    The pane must be running OMP itself, and that exact process must hold one
-    canonical transcript open whose header session id agrees with its filename.
-    Anything less is an ordinary terminal, which keeps its native capture.
+    The pane must be running OMP itself — directly, or as the single OMP inside
+    its shell's terminal-foreground process group — and that exact process must
+    hold one canonical transcript open whose header session id agrees with its
+    filename. Anything less is an ordinary terminal, which keeps its native
+    capture.
     """
     _, output = run_tern(["process", block, "--json"])
     foreground = json.loads(output).get("foreground") or {}

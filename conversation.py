@@ -19,12 +19,15 @@ store via phone_uploads and surface as ordinary `attachments` wire metadata
 on their message: native `{type:"image"}` content blocks and
 `fileMention` `files[].image` payloads (inline base64 or `blob:sha256:`
 references resolved from OMP's real content-addressed blob store), toolResult
-`details.images`, and assistant Markdown image/image-file links whose
-destination is a local raster file (angle-bracket paths with spaces, `file://`
-URLs, and paths relative to the session's own `cwd`). External URLs, fenced
-code and unreadable or non-raster destinations stay byte-for-byte untouched;
-a missing image never breaks the capture. Every capture republishes the
-referenced media ids so hidden or abandoned-branch images stay unservable.
+`details.images`, and assistant image outputs: Markdown image/image-file links
+whose destination is a local raster file (angle-bracket paths with spaces,
+`file://` URLs, and paths relative to the session's own `cwd`), explicit
+`MEDIA:<path>` markers, and inline `data:image/...;base64,` Markdown images
+whose payload decodes to a bounded raster. External URLs, fenced code, inline
+code spans, and unreadable, malformed or non-raster destinations stay
+byte-for-byte untouched; a missing image never breaks the capture. Every
+capture republishes the referenced media ids so hidden or abandoned-branch
+images stay unservable.
 
 A missing path raises `FileNotFoundError`. Complete (newline-terminated)
 records are decoded and parsed strictly, so a malformed terminated record or a
@@ -64,6 +67,9 @@ MAX_IMAGE_BASE64 = (phone_uploads.MAX_UPLOAD_BYTES // 3 + 1) * 4 + 1024
 IMAGE_LINK_PATTERN = re.compile(
     r"(!)?\[([^\]\n]*)\]\(\s*(<[^>\n]+>|[^\s)]+)(?:\s+[\"'][^\"'\n]*[\"'])?\s*\)")
 IMAGE_LINK_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
+# The explicit marker OMP assistants emit for a generated file, e.g.
+# `Here it is: MEDIA:/tmp/shot.png`; angle brackets carry paths with spaces.
+MEDIA_MARKER_PATTERN = re.compile(r"(?<![\w(])MEDIA:(<[^<>\n]*>|[^\s<>]+)")
 SCHEME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
 
 
@@ -179,9 +185,32 @@ def _local_image_path(dest: str, cwd: str) -> Path | None:
     return path
 
 
+def _stage_data_url(session: str, dest: str) -> dict | None:
+    """Stage the bytes of one inline `data:image/...;base64,` destination."""
+    if len(dest) > MAX_IMAGE_BASE64:
+        return None
+    _, separator, payload = dest.partition(";base64,")
+    if not separator:
+        return None
+    try:
+        data = base64.b64decode(payload, validate=True)
+    except ValueError:
+        return None
+    return phone_uploads.stage_media_bytes(session, data)
+
+
 def _replace_link(match, session: str, cwd: str, attachments: list[dict]) -> str:
-    """Stage one matched local image link, or leave the construct untouched."""
-    path = _local_image_path(match.group(3), cwd)
+    """Stage one matched local or inline data image link, or leave it untouched."""
+    dest = match.group(3)
+    if dest.startswith("<") and dest.endswith(">"):
+        dest = dest[1:-1]
+    if dest.startswith(DATA_URL_PREFIX):
+        record = _stage_data_url(session, dest)
+        if record is None:
+            return match.group(0)
+        _attach(attachments, record)
+        return match.group(2).strip()
+    path = _local_image_path(dest, cwd)
     if path is None:
         return match.group(0)
     if match.group(1) != "!" and path.suffix.lower() not in IMAGE_LINK_EXTENSIONS:
@@ -194,11 +223,72 @@ def _replace_link(match, session: str, cwd: str, attachments: list[dict]) -> str
     return caption if caption else path.name
 
 
-def _rewrite_local_images(session: str, cwd: str, text: str, attachments: list[dict]) -> str:
-    """Replace local raster image links with captions plus staged attachments.
+def _replace_media(match, session: str, cwd: str, attachments: list[dict]) -> str:
+    """Stage one `MEDIA:<path>` marker, or leave the marker untouched."""
+    path = _local_image_path(match.group(1), cwd)
+    if path is None:
+        return match.group(0)
+    record = phone_uploads.stage_media(session, path, name=path.name)
+    if record is None:
+        return match.group(0)
+    _attach(attachments, record)
+    return ""
 
-    Fenced code lines are copied verbatim; external URLs and links whose file
-    is missing or not a supported raster are left untouched.
+
+def _inline_code_spans(line: str) -> list[tuple[int, int]]:
+    """Character spans of one line's inline code, keyed by matched backtick runs."""
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(line):
+        if line[index] != "`":
+            index += 1
+            continue
+        start = index
+        while index < len(line) and line[index] == "`":
+            index += 1
+        ticks = line[start:index]
+        cursor = index
+        while True:
+            close = line.find(ticks, cursor)
+            if close < 0:
+                break
+            end = close + len(ticks)
+            while end < len(line) and line[end] == "`":
+                end += 1
+            if end - close == len(ticks):
+                spans.append((start, end))
+                index = end
+                break
+            cursor = end
+    return spans
+
+
+def _sub_generated_images(session: str, cwd: str, segment: str, attachments: list[dict]) -> str:
+    """Stage the image constructs of one text segment outside any inline code."""
+    segment = IMAGE_LINK_PATTERN.sub(
+        lambda match: _replace_link(match, session, cwd, attachments), segment)
+    return MEDIA_MARKER_PATTERN.sub(
+        lambda match: _replace_media(match, session, cwd, attachments), segment)
+
+
+def _rewrite_line_images(session: str, cwd: str, line: str, attachments: list[dict]) -> str:
+    """Rewrite one non-fenced line; inline code spans stay byte-for-byte."""
+    out: list[str] = []
+    previous = 0
+    for start, end in _inline_code_spans(line):
+        out.append(_sub_generated_images(session, cwd, line[previous:start], attachments))
+        out.append(line[start:end])
+        previous = end
+    out.append(_sub_generated_images(session, cwd, line[previous:], attachments))
+    return "".join(out)
+
+
+def _rewrite_local_images(session: str, cwd: str, text: str, attachments: list[dict]) -> str:
+    """Replace generated image constructs with captions plus staged attachments.
+
+    Fenced code lines and inline code spans are copied verbatim; external URLs
+    and markers/links whose file is missing or not a supported raster stay
+    untouched. A staged `MEDIA:<path>` marker is dropped from the text.
     """
     out: list[str] = []
     fence = None
@@ -214,8 +304,7 @@ def _rewrite_local_images(session: str, cwd: str, text: str, attachments: list[d
             fence = (marker[1][0], len(marker[1]))
             out.append(line)
             continue
-        out.append(IMAGE_LINK_PATTERN.sub(
-            lambda match: _replace_link(match, session, cwd, attachments), line))
+        out.append(_rewrite_line_images(session, cwd, line, attachments))
     return "\n".join(out)
 
 
@@ -387,6 +476,8 @@ def _entry_messages(entry: dict, session: str, cwd: str) -> list[dict]:
                 if isinstance(text, str) and text.strip():
                     attachments = []
                     text = _rewrite_local_images(session, cwd, text, attachments)
+                    if attachments and not text.strip():
+                        text = "[image]"
                     wire = _message(entry_id, "assistant", text, "markdown")
                     if attachments:
                         wire["attachments"] = attachments

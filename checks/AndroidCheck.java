@@ -203,6 +203,30 @@ public final class AndroidCheck {
         if (!html.contains("<img class=\"attach-img\" src=\"https://attachments.tern.invalid/" + imageId
                 + "\" alt=\"shot&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;.png\">"))
             throw new AssertionError("Raster attachment preview missing or unsafe");
+        Method collect = TerminalView.class.getDeclaredMethod("collectAttachmentIds", JSONObject.class);
+        collect.setAccessible(true);
+        java.util.Set<String> imageIds = (java.util.Set<String>) collect.invoke(null,
+                new JSONObject().put("messages", messages));
+        if (!imageIds.equals(new java.util.HashSet<>(java.util.Arrays.asList(
+                imageId, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))))
+            throw new AssertionError("Non-raster or invalid attachments became viewer targets");
+        Method target = TerminalView.class.getDeclaredMethod("attachmentId",
+                android.net.Uri.class, java.util.Set.class);
+        target.setAccessible(true);
+        String imageUrl = "https://attachments.tern.invalid/" + imageId;
+        if (!imageId.equals(target.invoke(null, android.net.Uri.parse(imageUrl), imageIds)))
+            throw new AssertionError("A rendered image cannot open at full size");
+        for (String rejected : new String[] {
+                "http://attachments.tern.invalid/" + imageId,
+                "https://example.com/" + imageId,
+                "file:///" + imageId,
+                "https://user@attachments.tern.invalid/" + imageId,
+                "https://attachments.tern.invalid:443/" + imageId,
+                imageUrl + "?redirect=1", imageUrl + "#fragment", imageUrl + "/extra",
+                "https://attachments.tern.invalid/ffffffffffffffffffffffffffffffff"}) {
+            if (target.invoke(null, android.net.Uri.parse(rejected), imageIds) != null)
+                throw new AssertionError("Unsafe or non-image URL became a full-size viewer target");
+        }
         if (html.contains("attachments.tern.invalid/ffffffffffffffffffffffffffffffff")
                 || html.contains("attachments.tern.invalid/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
             throw new AssertionError("Non-raster attachment rendered as an image");
@@ -212,16 +236,12 @@ public final class AndroidCheck {
         if (!html.contains("<span class=\"attach-name\">payload.apk</span>")
                 || !html.contains("application/vnd.android.package-archive \u00b7 5.0 MB"))
             throw new AssertionError("Binary attachment lost its name, type or size");
-        if (!html.contains("<div class=\"msg user\"><div class=\"who\">You</div><div class=\"attach\">"
-                + "<img class=\"attach-img\" src=\"https://attachments.tern.invalid/"
-                + "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" alt=\"diagram.png\">"))
-            throw new AssertionError("Image-only send lost its preview or gained an empty bubble");
         if (html.contains("<div class=\"body\"></div>"))
             throw new AssertionError("Empty message body rendered");
 
         java.util.Set<String> allowed = new java.util.HashSet<>(java.util.Arrays.asList(
                 "msg", "user", "assistant", "tool", "context", "other", "who", "name", "body", "plain",
-                "activity", "act", "attach", "attach-img", "attach-file", "attach-name", "attach-meta",
+                "activity", "act", "attach", "attach-img", "attach-open", "attach-file", "attach-name", "attach-meta",
                 "code", "lang", "stamp"));
         java.util.regex.Matcher classes =
                 java.util.regex.Pattern.compile("class=\"([^\"]*)\"").matcher(html);

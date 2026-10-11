@@ -10,6 +10,7 @@ The Android app talks to `tern_bridge.py` on your computer. The bridge uses Tern
 - Pair with a camera QR scan or a saved QR image.
 - Group live terminal blocks by session. Use each session/agent’s **⋮** menu to hide it on this phone; restore it from **Hidden sessions/agents**. Desktop sessions keep running. Flow/background sessions remain behind their separate toggle.
 - Read clean OMP chats with Markdown headings, tables, quotes, labelled code blocks, image previews, file cards and collapsed technical activity; ordinary terminal blocks retain their terminal view.
+- Tap a chat image to open its original attachment full-screen. Pinch to zoom, drag to pan, and use Back to return to the same chat.
 - Write multiline messages and submit with **Send**. Use Android’s native text-selection menu to paste without submitting.
 - Attach images or files through the system picker, including multi-select and image-only messages.
 - Open **Tools** for Enter, Ctrl+C, Escape, Tab, arrow keys and **Ctrl+P** for compatible model cycling.
@@ -141,7 +142,7 @@ The updater rejects an unexpected package, different signing certificate, older 
 - **HTTP 401:** generate a new QR from the current bridge token and pair again.
 - **No sessions:** run `tern ls --json` on the computer. The bridge must run as the user who owns those sessions.
 - **Send not confirmed:** update `tern_bridge.py`, `conversation.py` and `phone_uploads.py`, then restart the bridge. OMP sends use one bracketed paste plus a literal carriage return, and success requires a newly persisted user message. If acceptance times out, the text and files stay on the phone; check the desktop before retrying.
-- **Screen differs from desktop:** update all three bridge files. OMP conversations come from the foreground process’s exact session transcript, including version-renamed OMP executables; other terminal blocks use Tern’s `capture --surfaces` support.
+- **Screen differs from desktop:** update all three bridge files. OMP conversations come from the foreground process’s exact session transcript, including version-renamed OMP executables and a single OMP child in a Linux terminal’s foreground process group; other terminal blocks use Tern’s `capture --surfaces` support.
 - **Model does not cycle:** Ctrl+P reaches the terminal. Its meaning depends on the terminal program’s key bindings.
 - **Camera unavailable:** use **Load QR image**. Camera behavior still needs checking on each physical phone model.
 - **Update certificate mismatch:** use the official release. Do not uninstall the app to bypass the check.
@@ -174,6 +175,16 @@ python3 checks/check_terminal_settings.py --serial YOUR_ADB_SERIAL
 This exercises the native slider, preview, persistence and reset, restores the original font size, and force-stops the app. It does not change saved PCs or open backend sessions.
 
 A release APK must retain the publisher’s signing identity. Local debug APKs use a different signer and cannot receive production-signed updates in place.
+
+## 1.5.2 changes
+
+Added full-screen original-attachment viewing with native pinch zoom and panning. The viewer uses the authenticated attachment stream, not a resized chat thumbnail; external navigation, scripts and arbitrary file access remain blocked.
+
+Fixed Linux panes reported as a shell while OMP runs in that same terminal-foreground process group. The shared resolver now finds the single OMP process and its canonical open transcript; background, unrelated and ambiguous processes do not qualify.
+
+Generated-image `MEDIA:<path>` markers and inline base64 raster-image links now become session-bound previews. Code spans/fences, external links and invalid images stay untouched.
+
+Verified on Android 15 with the existing Donnager-generated 1536×1024 PNG: byte-exact retrieval, tap-to-open, two-finger zoom, horizontal panning and Back navigation.
 
 ## 1.5.1 changes
 
